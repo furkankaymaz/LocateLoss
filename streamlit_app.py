@@ -1,6 +1,3 @@
-# ==============================================================================
-#           NİHAİ KOD: KULLANIMA HAZIR STREAMLIT UYGULAMASI
-# ==============================================================================
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
@@ -10,21 +7,14 @@ from openai import OpenAI
 import json
 import re
 
-# ------------------------------------------------------------------------------
-# 1. TEMEL AYARLAR VE API ANAHTARI KONTROLÜ
-# ------------------------------------------------------------------------------
-
 # Sayfa Genişliğini Ayarlama
 st.set_page_config(layout="wide")
 st.title("🚨 Endüstriyel Hasar Analiz Paneli")
 st.markdown("---")
 
 # --- KULLANICI AYARI ---
-# API Anahtarınız `xai-` ile başladığı için servis "Grok_XAI" olarak ayarlandı.
-# Bu ayar sayesinde kod, doğru sunucuya bağlanacaktır.
-API_SERVICE = "Grok_XAI" 
-
 # API Servis Bilgileri
+API_SERVICE = "Grok_XAI" 
 API_CONFIGS = {
     "Groq": {
         "base_url": "https://api.groq.com/openai/v1",
@@ -32,7 +22,7 @@ API_CONFIGS = {
     },
     "Grok_XAI": {
         "base_url": "https://api.x.ai/v1",
-        "model": "grok-1",
+        "model": "grok-beta",  # Revize: Erişilebilir model (grok-1 yerine grok-beta veya grok-3)
     }
 }
 SELECTED_CONFIG = API_CONFIGS[API_SERVICE]
@@ -56,7 +46,9 @@ def validate_api_key(key, base_url, model):
         return True, f"API anahtarı doğrulandı ve **{API_SERVICE}** servisine başarıyla bağlandı!", ""
     except Exception as e:
         error_message = str(e)
-        if "401" in error_message:
+        if "404" in error_message or "model" in error_message.lower():
+            return False, "Model erişimi yok (Hata 404).", f"Model '{model}' mevcut değil veya takımınıza erişim yok. x.ai console'dan model erişimini kontrol edin (grok-beta veya grok-3 deneyin)."
+        elif "401" in error_message:
             return False, "API Anahtarı Geçersiz (Hata 401).", f"Streamlit Secrets'e eklediğiniz anahtar **{API_SERVICE}** servisi tarafından reddedildi. Lütfen anahtarın doğru olduğundan ve bu servise ait olduğundan emin olun."
         else:
             return False, "Bilinmeyen bir API hatası oluştu.", f"Hata detayı: {error_message}"
@@ -74,7 +66,7 @@ if is_valid:
 else:
     st.error(f"❌ **HATA:** {status_message}")
     st.warning(f"👉 **ÇÖZÜM ÖNERİSİ:** {solution_message}")
-    st.stop() # Hata varsa uygulamayı burada durdurarak devam etmesini engelle
+    st.stop() # Hata varsa uygulamayı burada durdur
 
 # --- Buradan Sonrası Sadece API Testi Başarılı Olduğunda Çalışır ---
 st.markdown("---")
