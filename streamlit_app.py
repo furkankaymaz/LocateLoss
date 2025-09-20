@@ -1,5 +1,5 @@
 # ==============================================================================
-#      NİHAİ KOD (v8.4): f-string Formatlama Hatası Düzeltildi
+#      NİHAİ KOD (v9.0): Güvenilir Veri Kaynağı Entegrasyonu
 # ==============================================================================
 import streamlit as st
 import pandas as pd
@@ -9,6 +9,8 @@ from streamlit_folium import folium_static
 from openai import OpenAI
 import json
 import re
+import feedparser # Haberleri çekmek için yeni kütüphane
+from urllib.parse import quote # URL'de Türkçe karakterleri kodlamak için
 
 # ------------------------------------------------------------------------------
 # 1. TEMEL AYARLAR
@@ -46,44 +48,37 @@ else:
     st.sidebar.error(f"❌ {status_message}"); st.sidebar.warning(solution_message); st.stop()
 
 # ------------------------------------------------------------------------------
-# 3. İKİ AŞAMALI VERİ ÇEKME FONKSİYONLARI
+# 3. VERİ ÇEKME VE ANALİZ FONKSİYONLARI
 # ------------------------------------------------------------------------------
 
-@st.cache_data(ttl=900)
-def find_latest_events(key, base_url, model, event_count=5):
-    client = OpenAI(api_key=key, base_url=base_url)
-    current_date = datetime.now().strftime('%Y-%m-%d')
+# YENİ FONKSİYON: Google Haberler RSS üzerinden güvenilir şekilde olayları bulur.
+@st.cache_data(ttl=900) # 15 dakikada bir haberleri yeniden kontrol et
+def fetch_news_from_google_rss(limit=5):
+    # Anahtar kelimelerle daha isabetli sonuçlar alıyoruz
+    search_query = '"fabrika yangını" OR "sanayi sitesinde yangın" OR "endüstriyel patlama" OR "OSB yangın"'
+    encoded_query = quote(search_query)
     
-    # DÜZELTME: f-string içindeki literal {} karakterleri {{}} olarak yazıldı.
-    prompt = f"""
-    Bugünün tarihi {current_date}. Görevin, Türkiye'de son 3 ay içinde meydana gelmiş önemli endüstriyel hasar olaylarını (fabrika yangını, kimyasal sızıntı, büyük patlama vb.) bulmaktır.
+    # Google News Türkiye için RSS URL'i
+    rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=tr&gl=TR&ceid=TR:tr"
     
-    Bana bulduğun olaylar arasından **en güncel {event_count} tanesinin** bir listesini ver.
-    
-    Öncelikli kaynakların X (Twitter) ve güvenilir ulusal haber ajansları (Anadolu Ajansı, Demirören Haber Ajansı vb.) olsun.
-    
-    Çıktıyı, her olay için "headline" (manşet) ve "url" (haber linki) anahtarlarını içeren bir JSON dizisi olarak döndür. Başka hiçbir açıklama veya metin ekleme. Sadece ham JSON dizisini ver.
-    Örnek: [ {{"headline": "...", "url": "..."}} ]
-    """
     try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1024,
-            temperature=0.0
-        )
-        content = response.choices[0].message.content.strip()
-        match = re.search(r'\[.*\]', content, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-        else:
-            st.warning("API'den geçerli bir JSON dizisi alınamadı. Ham yanıt aşağıdadır:")
-            st.code(content)
+        feed = feedparser.parse(rss_url)
+        if not feed.entries:
+            st.warning("Google Haberler RSS akışından herhangi bir sonuç bulunamadı.")
             return []
+            
+        events = []
+        for entry in feed.entries[:limit]:
+            events.append({
+                "headline": entry.title,
+                "url": entry.link
+            })
+        return events
     except Exception as e:
-        st.error(f"Olay arama sırasında bir hata oluştu: {e}")
+        st.error(f"Haber akışı çekilirken bir hata oluştu: {e}")
         return []
 
+# ANALİZ FONKSİYONU (Değişiklik yok, hala aynı görevi yapıyor)
 @st.cache_data(ttl=86400)
 def analyze_single_event(key, base_url, model, headline, url):
     client = OpenAI(api_key=key, base_url=base_url)
@@ -98,11 +93,11 @@ def analyze_single_event(key, base_url, model, headline, url):
     - "tesis_adi_ticari_unvan"
     - "sehir_ilce"
     - "olay_tipi_ozet"
-    - "hasar_tahmini" (Bu bir nesne olmalı: "tutar_araligi_tl", "kaynak", "aciklama" alt anahtarlarıyla)
-    - "can_kaybi_ve_yaralilar" (Bu bir nesne olmalı: "durum", "detaylar" alt anahtarlarıyla)
-    - "cevre_tesis_analizi" (Bu bir nesneler dizisi olmalı: "tesis_adi", "risk_faktoru", "aciklama" alt anahtarlarıyla)
-    - "kaynak_linkleri" (Bu bir metin dizisi olmalı)
-    - "gorsel_linkleri" (Bu bir metin dizisi olmalı)
+    - "hasar_tahmini" (nesne: "tutar_araligi_tl", "kaynak", "aciklama")
+    - "can_kaybi_ve_yaralilar" (nesne: "durum", "detaylar")
+    - "cevre_tesis_analizi" (nesneler dizisi: "tesis_adi", "risk_faktoru", "aciklama")
+    - "kaynak_linkleri" (metin dizisi)
+    - "gorsel_linkleri" (metin dizisi)
     - "latitude"
     - "longitude"
 
@@ -126,31 +121,45 @@ def analyze_single_event(key, base_url, model, headline, url):
         return None
 
 # ------------------------------------------------------------------------------
-# 4. GÖRSEL ARAYÜZ (Bu bölümde değişiklik yapılmadı)
+# 4. GÖRSEL ARAYÜZ
 # ------------------------------------------------------------------------------
 st.header("📈 En Son Tespit Edilen Hasarlar (Test Modu: Son 1 Olay)")
 
 if st.button("En Son Olayı Bul ve Analiz Et", type="primary", use_container_width=True):
-    with st.spinner("1. Aşama: Son olaylar taranıyor..."):
-        latest_events = find_latest_events(api_key, SELECTED_CONFIG["base_url"], SELECTED_CONFIG["model"])
+    # DEĞİŞİKLİK: Artık yapay zeka yerine güvenilir RSS kaynağını çağırıyoruz.
+    with st.spinner("1. Aşama: Güvenilir haber kaynakları taranıyor..."):
+        latest_events = fetch_news_from_google_rss(limit=1) # Test için sadece 1 haber alalım
 
     if not latest_events:
-        st.info("Belirtilen kriterlere uygun, raporlanacak bir endüstriyel olay tespit edilemedi.")
+        st.info("Belirtilen anahtar kelimelerle (fabrika yangını vb.) son zamanlarda raporlanmış bir olay bulunamadı.")
     else:
-        st.success(f"**{len(latest_events)} adet potansiyel olay bulundu.** Şimdi en güncel olanı derinlemesine analiz ediliyor...")
+        st.success(f"**1 adet potansiyel olay bulundu.** Şimdi yapay zeka ile derinlemesine analiz ediliyor...")
 
         event = latest_events[0]
-        event_details = analyze_single_event(api_key, SELECTED_CONFIG["base_url"], SELECTED_CONFIG["model"], event.get('headline'), event.get('url'))
+        with st.spinner(f"2. Aşama: '{event.get('headline')}' başlıklı haber analiz ediliyor..."):
+            event_details = analyze_single_event(api_key, SELECTED_CONFIG["base_url"], SELECTED_CONFIG["model"], event.get('headline'), event.get('url'))
 
         if not event_details:
-            st.error("Olay bulundu ancak detaylı analiz sırasında bir sorun oluştu veya analiz sonucu geçerli formatta değildi.")
+            st.error("Olay bulundu ancak yapay zeka analizi sırasında bir sorun oluştu veya analiz sonucu geçerli formatta değildi.")
         else:
+            # Raporlama ve Haritalama bölümü eskisi gibi devam ediyor...
             events_df = pd.DataFrame([event_details])
-            events_df['olay_tarihi_saati'] = pd.to_datetime(events_df['olay_tarihi_saati'], errors='coerce')
+            # ... (Bundan sonraki kod aynı kaldığı için kısaltılmıştır)
+            
+            # Önceki versiyondaki raporlama kodunun tamamı buraya gelecek.
+            # Kodun geri kalanını bir önceki versiyondan kopyalayabilirsiniz.
+            # (Streamlit arayüz, expander, harita vb. kısımlar)
+            events_df['olay_tarihi_saati'] = pd.to_datetime(events_df.get('olay_tarihi_saati'), errors='coerce')
             st.subheader("Analiz Edilen Son Olay Raporu")
 
             row = events_df.iloc[0].fillna('')
-            with st.expander(f"**{row['olay_tarihi_saati'].strftime('%d %b %Y, %H:%M')} - {row['tesis_adi_ticari_unvan']} ({row['sehir_ilce']})**", expanded=True):
+            
+            # Tarih formatlaması için kontrol
+            tarih_str = "Tarih Belirtilmemiş"
+            if pd.notna(row['olay_tarihi_saati']):
+                tarih_str = row['olay_tarihi_saati'].strftime('%d %b %Y, %H:%M')
+
+            with st.expander(f"**{tarih_str} - {row['tesis_adi_ticari_unvan']} ({row['sehir_ilce']})**", expanded=True):
                 st.subheader(row['olay_tipi_ozet'])
                 st.info(f"**Güncel Durum:** {row['guncel_durum']}")
 
@@ -167,7 +176,7 @@ if st.button("En Son Olayı Bul ve Analiz Et", type="primary", use_container_wid
                     st.write(hasar_tahmini.get('aciklama', ''))
 
                     can_kaybi = row.get('can_kaybi_ve_yaralilar', {})
-                    if can_kaybi.get('durum', 'Bilinmiyor').lower() == 'evet':
+                    if can_kaybi and can_kaybi.get('durum', 'Bilinmiyor').lower() == 'evet':
                         st.error(f"**Can Kaybı / Yaralı:** {can_kaybi.get('detaylar', 'Detay belirtilmemiş.')}")
 
                 with col2:
@@ -187,7 +196,11 @@ if st.button("En Son Olayı Bul ve Analiz Et", type="primary", use_container_wid
                     st.write("Kaynak link bulunamadı.")
 
             st.header("🗺️ Olay Yeri İncelemesi")
+            # Enlem/boylam değerlerini sayısal yapmaya çalış, hatalı olanı NaN yap
+            events_df['latitude'] = pd.to_numeric(events_df['latitude'], errors='coerce')
+            events_df['longitude'] = pd.to_numeric(events_df['longitude'], errors='coerce')
             map_df = events_df.dropna(subset=['latitude', 'longitude'])
+            
             if not map_df.empty:
                 row = map_df.iloc[0]
                 map_center = [row['latitude'], row['longitude']]
@@ -205,3 +218,5 @@ if st.button("En Son Olayı Bul ve Analiz Et", type="primary", use_container_wid
                 ).add_to(m)
 
                 folium_static(m, width=None, height=500)
+            else:
+                st.warning("Olay için geçerli bir konum (enlem/boylam) bilgisi bulunamadığından harita gösterilemiyor.")
