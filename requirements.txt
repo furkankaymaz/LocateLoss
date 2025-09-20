@@ -1,6 +1,7 @@
-streamlit
-pandas
-folium
-openai
+pip install
+streamlit 
+folium 
 requests
-feedparser
+pandas 
+geopy 
+googlemaps
