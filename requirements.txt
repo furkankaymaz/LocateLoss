@@ -1,7 +1,6 @@
-streamlit==1.38.0
-pandas==2.3.2
-folium==0.20.0
-streamlit-folium==0.25.1
-geopy==2.4.1
-googlemaps==4.10.0
-requests==2.32.5
+streamlit
+pandas
+folium
+openai
+requests
+feedparser
