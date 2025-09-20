@@ -1,5 +1,5 @@
 # ==============================================================================
-#           NİHAİ KOD (v8): TEK OLAY ODAKLI HATA AYIKLAMA VE GELİŞTİRİLMİŞ HARİTA
+#           NİHAİ KOD (v8.1): f-string SÖZDİZİMİ DÜZELTMESİ
 # ==============================================================================
 import streamlit as st
 import pandas as pd
@@ -20,7 +20,7 @@ st.title("🚨 Akıllı Endüstriyel Hasar Takip Platformu")
 st.markdown(f"**Son Güncelleme:** {datetime.now().strftime('%d %B %Y, %H:%M')}")
 st.markdown("---")
 
-API_SERVICE = "Grok_XAI" 
+API_SERVICE = "Grok_XAI"
 API_CONFIGS = {"Grok_XAI": {"base_url": "https://api.x.ai/v1", "model": "grok-4-fast-reasoning"}}
 SELECTED_CONFIG = API_CONFIGS[API_SERVICE]
 API_KEY_NAME = "GROK_API_KEY"
@@ -58,7 +58,8 @@ def find_latest_events(key, base_url, model, event_count=1): # DEBUG: event_coun
     Bugünün tarihi {current_date}. Türkiye'de son 3 ay içinde yaşanmış endüstriyel hasar olaylarını (fabrika yangını, patlama vb.) tara.
     Bulduğun olaylar arasından bana **en güncel {event_count} tanesini** listele. Özellikle son 72 saatteki olaylara öncelik ver.
     Öncelikli kaynakların X (Twitter)'daki resmi hesaplar (valilik, itfaiye) ve ulusal haber ajansları (AA, DHA) olsun.
-    Çıktıyı, {"headline": "...", "url": "..."} anahtarlarını içeren bir JSON dizisi olarak ver. Sadece listele.
+    # DÜZELTME: f-string içinde literal {} kullanmak için {{}} kullanılır.
+    Çıktıyı, {{"headline": "...", "url": "..."}} anahtarlarını içeren bir JSON dizisi olarak ver. Sadece listele.
     """
     try:
         response = client.chat.completions.create(model=model, messages=[{"role": "user", "content": prompt}], max_tokens=512, temperature=0.0)
@@ -71,6 +72,7 @@ def find_latest_events(key, base_url, model, event_count=1): # DEBUG: event_coun
 @st.cache_data(ttl=86400)
 def analyze_single_event(key, base_url, model, headline, url):
     client = OpenAI(api_key=key, base_url=base_url)
+    # DÜZELTME: f-string içindeki tüm JSON örnekleri {{ ve }} ile güncellendi.
     prompt = f"""
     Sen bir sigorta hasar eksperisin. Sana verilen şu haberi analiz et: "{headline}" ({url}).
     GÖREVİN: X (Twitter) ve diğer haber ajanslarını kullanarak bu tek olayı çapraz kontrol et ve aşağıdaki JSON formatında detaylı bir rapor oluştur.
@@ -112,24 +114,23 @@ if st.button("En Son Olayı Bul ve Analiz Et", type="primary", use_container_wid
     if not latest_events:
         st.info("Belirtilen kriterlere uygun, raporlanacak bir endüstriyel olay tespit edilemedi.")
     else:
-        st.success(f"**1 adet potansiyel olay bulundu.** Şimdi derinlemesine analiz ediliyor...")
-        
+        st.success(f"**1 adet potensiyel olay bulundu.** Şimdi derinlemesine analiz ediliyor...")
+
         event = latest_events[0]
         event_details = analyze_single_event(api_key, SELECTED_CONFIG["base_url"], SELECTED_CONFIG["model"], event.get('headline'), event.get('url'))
-        
+
         if not event_details:
             st.warning("Olay bulundu ancak detaylı analiz sırasında bir sorun oluştu veya analiz sonucu geçerli formatta değildi.")
         else:
             events_df = pd.DataFrame([event_details]) # Tek olaylık bir DataFrame oluştur
             events_df['olay_tarihi_saati'] = pd.to_datetime(events_df['olay_tarihi_saati'], errors='coerce')
             st.subheader("Analiz Edilen Son Olay Raporu")
-            
+
             row = events_df.iloc[0].fillna('') # Tek satırı al
             with st.expander(f"**{row['olay_tarihi_saati'].strftime('%d %b %Y, %H:%M')} - {row['tesis_adi_ticari_unvan']} ({row['sehir_ilce']})**", expanded=True):
-                 # ... (Rapor detayları önceki kodla aynı kalabilir, UI zaten iyi)
                 st.subheader(row['olay_tipi_ozet'])
                 st.info(f"**Güncel Durum:** {row['guncel_durum']}")
-                
+
                 gorsel_linkleri = row.get('gorsel_linkleri')
                 if gorsel_linkleri and isinstance(gorsel_linkleri, list) and gorsel_linkleri[0]:
                     st.image(gorsel_linkleri[0], caption="Olay Yerinden Görüntü", use_column_width=True)
@@ -141,18 +142,17 @@ if st.button("En Son Olayı Bul ve Analiz Et", type="primary", use_container_wid
                     st.markdown(f"##### Hasar Tahmini: `{hasar_tahmini.get('tutar_araligi_tl', 'Belirtilmemiş')}`")
                     st.caption(f"Kaynak: {hasar_tahmini.get('kaynak', 'Bilinmiyor')}")
                     st.write(hasar_tahmini.get('aciklama', ''))
-                    
+
                     can_kaybi = row.get('can_kaybi_ve_yaralilar', {})
                     if can_kaybi.get('durum', 'Bilinmiyor').lower() == 'evet':
                         st.error(f"**Can Kaybı / Yaralı:** {can_kaybi.get('detaylar', 'Detay belirtilmemiş.')}")
 
                 with col2:
-                    sigorta = row.get('sigorta_teminatlari_analizi', {})
-                    st.markdown("##### Potansiyel Sigorta Teminatları"); st.json(sigorta)
-                
-                st.markdown("---"); st.markdown("##### Çevre Tesisler İçin Risk Analizi")
-                st.table(pd.DataFrame(row.get('cevre_tesis_analizi',[])))
-                
+                    # sigorta teminatları kaldırıldı, prompt'ta da yoktu.
+                    # Eğer istenirse tekrar eklenebilir.
+                    st.markdown("##### Çevre Tesisler İçin Risk Analizi")
+                    st.table(pd.DataFrame(row.get('cevre_tesis_analizi',[])))
+
                 st.markdown("---"); st.markdown("##### Tıklanabilir Kaynak Linkleri")
                 links_md = "".join([f"- [{link.split('//')[-1].split('/')[0]}]({link})\n" for link in row.get('kaynak_linkleri', [])])
                 st.markdown(links_md)
@@ -180,7 +180,7 @@ if st.button("En Son Olayı Bul ve Analiz Et", type="primary", use_container_wid
                     {gorsel_html}
                     <h4>{row['tesis_adi_ticari_unvan']}</h4>
                     <p><b>Durum:</b> {row['guncel_durum']}</p>
-                    <p><b>Hasar Tahmini:</b> {row.get('hasar_tahmini', {}).get('tutar_araligi_tl', 'N/A')}</p>
+                    <p><b>Hasar Tahmini:</b> {row.get('hasar_tahmini', {{}}).get('tutar_araligi_tl', 'N/A')}</p>
                     <hr>
                     {komsu_tesisler_html}
                 </div>
@@ -194,5 +194,5 @@ if st.button("En Son Olayı Bul ve Analiz Et", type="primary", use_container_wid
                     tooltip=row['tesis_adi_ticari_unvan'],
                     icon=folium.Icon(color='red', icon='fire')
                 ).add_to(m)
-                
+
                 folium_static(m, width=None, height=500)
