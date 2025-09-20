@@ -1,5 +1,5 @@
 # ==============================================================================
-#      NİHAİ KOD (v25.1): Akıllı Veri Çekme ve Yönlendirme Takibi
+#      NİHAİ MVP KODU (v28.0): İki Aşamalı AI Analizi (Araştırmacı -> Analist)
 # ==============================================================================
 import streamlit as st
 import pandas as pd
@@ -11,7 +11,6 @@ import re
 import requests
 import feedparser
 from urllib.parse import quote
-from bs4 import BeautifulSoup
 
 # ------------------------------------------------------------------------------
 # 1. TEMEL AYARLAR
@@ -28,7 +27,7 @@ client = OpenAI(api_key=grok_api_key, base_url="https://api.x.ai/v1") if grok_ap
 # 2. ÇEKİRDEK FONKSİYONLAR
 # ------------------------------------------------------------------------------
 
-# Adım 1: Otomatik Keşif - (Değişiklik yok)
+# Adım 1: En son olayın URL'ini bulur
 @st.cache_data(ttl=600)
 def get_latest_event_candidate_from_rss():
     search_query = '("fabrika yangını" OR "sanayi tesisi" OR "OSB yangın" OR "liman kaza" OR "depo patlaması" OR "enerji santrali")'
@@ -42,55 +41,37 @@ def get_latest_event_candidate_from_rss():
     except Exception as e:
         st.error(f"RSS haber kaynağına erişilirken hata oluştu: {e}"); return None
 
-# GÜNCELLEME: Adım 2: Veri Çekme - Artık Google yönlendirmelerini takip ediyor.
+# YENİ Adım 2: "Araştırmacı" AI - Verilen URL'in içeriğini özetler
 @st.cache_data(ttl=3600)
-def scrape_article_text(url):
-    try:
-        # Tarayıcı taklidi yapmak için User-Agent ekliyoruz.
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-        # allow_redirects=True (varsayılan) ile yönlendirmeleri otomatik takip et
-        response = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
-        response.raise_for_status() # 4xx veya 5xx hatalarını kontrol et
-
-        # Yönlendirme sonrası ulaşılan nihai URL'i kontrol et
-        final_url = response.url
-        if "google.com" in final_url:
-            return "Metin çekilemedi (Google yönlendirmesinden çıkılamadı)."
-
-        # Nihai sayfanın içeriğini işle
-        soup = BeautifulSoup(response.content, 'html.parser')
-        
-        paragraphs = soup.find_all('p')
-        full_text = "\n".join([p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 50]) # Çok kısa paragrafları (reklam, menü vb.) filtrele
-        
-        return full_text if full_text else "Metin çekilemedi (Sayfa içeriği boş veya paragraflar okunamadı)."
-    except requests.exceptions.RequestException as e:
-        st.warning(f"Haber metni çekilirken ağ hatası oluştu: {e}")
-        return f"Metin çekilemedi (Ağ Hatası: {e})."
-    except Exception as e:
-        st.warning(f"Haber metni çekilirken genel bir hata oluştu: {e}")
-        return f"Metin çekilemedi (Genel Hata: {e})."
-
-
-# Adım 3 ve 4: Derin Analiz ve Coğrafi Zenginleştirme (Değişiklik yok)
-# ... Bu fonksiyonlar (get_detailed_report, find_neighboring_facilities) bir önceki versiyon ile aynıdır.
-# Okunabilirlik için bu fonksiyonları buraya tekrar ekliyorum.
-@st.cache_data(ttl=3600)
-def get_detailed_report(_client, headline, url, article_text):
+def get_summary_from_url(_client, url):
     prompt = f"""
-    Sen, Türkiye odaklı, kanıta dayalı ve aşırı detaycı bir sigorta istihbarat analistisin.
-    ANA GÖREVİN: Sana aşağıda tam metnini verdiğim haberi ve başlığını analiz et.
-    - BAŞLIK: "{headline}"
-    - HABER METNİ: "{article_text[:4000]}"
+    Sen bir web araştırma asistanısın. Tek görevin var: Sana verilen '{url}' adresindeki haber makalesinin içeriğini oku ve bana olayın tüm detaylarını içeren, tarafsız ve kapsamlı bir özet metin sun. Reklamları ve alakasız kısımları atla, sadece haberin kendisine odaklan.
+    """
+    try:
+        response = _client.chat.completions.create(model="grok-4-fast-reasoning", messages=[{"role": "user", "content": prompt}], max_tokens=2048, temperature=0.0)
+        return response.choices[0].message.content
+    except Exception as e:
+        st.error(f"Araştırmacı AI (Özet Çıkarma) Hatası: {e}"); return None
 
-    İKİNCİL GÖREVİN: Yukarıdaki metinden bulduğun kilit isimler (potansiyel tesis adı, şehir vb.) ile **X (Twitter) üzerinde ek bir arama yaparak** bilgileri doğrula, ek detay, görgü tanığı ve kanıt bul.
-    NİHAİ HEDEF: Topladığın TÜM bilgileri (verilen haber metni ve X'ten buldukların) birleştirerek, aşağıdaki JSON formatında, mümkün olan en detaylı ve dolu raporu oluştur.
+# Adım 3: "Analist" AI - Özetlenmiş metinden nihai raporu oluşturur
+@st.cache_data(ttl=3600)
+def get_detailed_report_from_summary(_client, headline, summary_text):
+    prompt = f"""
+    Sen elit bir sigorta istihbarat analistisin. Sana bir hasar olayıyla ilgili, başka bir AI tarafından özetlenmiş olan aşağıdaki metni ve olayın başlığını veriyorum.
+    - BAŞLIK: "{headline}"
+    - OLAY ÖZETİ METNİ: "{summary_text}"
+
+    GÖREVİN: Bu metni ve içindeki anahtar kelimelerle **X (Twitter) üzerinde yapacağın zihinsel araştırmayı** kullanarak, aşağıdaki JSON formatında, mümkün olan en detaylı ve dolu raporu oluştur.
     
     JSON NESNE YAPISI:
-    - "tesis_adi", "tesis_adi_kanit", "sehir_ilce", "olay_tarihi", "hasarin_nedeni", "hasarin_fiziksel_boyutu", "yapilan_mudahale",
-    - "maddi_hasar_tahmini", "kar_kaybi_tahmini", "guncel_durum", "cevreye_etki", "latitude", "longitude",
+    - "tesis_adi": Yüksek doğrulukla tespit edilmiş ticari unvan.
+    - "tesis_adi_kanit": Tesis adının geçtiği cümlenin veya X paylaşımının doğrudan alıntısı.
+    - "sehir_ilce", "olay_tarihi", "hasarin_nedeni", "hasarin_fiziksel_boyutu", "yapilan_mudahale",
+    - "maddi_hasar_tahmini": Parasal maddi hasar bilgisi ve kaynağı.
+    - "kar_kaybi_tahmini": Üretim durması kaynaklı kar kaybı bilgisi ve kaynağı.
+    - "guncel_durum", "cevreye_etki", "latitude", "longitude",
     - "gorsel_url": Olayla ilgili en net fotoğrafın doğrudan URL'si (.jpg, .png).
-    - "kaynak_urller": Kullandığın tüm linklerin listesi.
+    - "kaynak_urller": Orijinal haberin linki.
     """
     try:
         response = _client.chat.completions.create(model="grok-4-fast-reasoning", messages=[{"role": "user", "content": prompt}], max_tokens=4096, temperature=0.1)
@@ -98,8 +79,9 @@ def get_detailed_report(_client, headline, url, article_text):
         match = re.search(r'\{.*\}', content, re.DOTALL)
         return json.loads(match.group(0)) if match else None
     except Exception as e:
-        st.error(f"Derin Analiz Motorunda Hata: {e}"); return None
+        st.error(f"Analist AI (Rapor Oluşturma) Hatası: {e}"); return None
 
+# Adım 4: Coğrafi Zenginleştirme
 @st.cache_data(ttl=86400)
 def find_neighboring_facilities(api_key, lat, lon, radius=500):
     if not api_key or not lat or not lon: return []
@@ -107,21 +89,17 @@ def find_neighboring_facilities(api_key, lat, lon, radius=500):
         url = f"https://maps.googleapis.com/maps/api/place/nearbysearch/json?location={float(lat)},{float(lon)}&radius={radius}&type=establishment&keyword=fabrika|depo|sanayi|tesis|lojistik|antrepo&key={api_key}"
         response = requests.get(url)
         results = response.json().get('results', [])
-        neighbors = []
-        for p in results[:10]:
-            loc = p.get('geometry', {}).get('location', {})
-            neighbors.append({"tesis_adi": p.get('name'), "tip": ", ".join(p.get('types', [])), "lat": loc.get('lat'), "lng": loc.get('lng')})
+        neighbors = [{"tesis_adi": p.get('name'), "tip": ", ".join(p.get('types', [])), "lat": p.get('geometry', {}).get('location', {}).get('lat'), "lng": p.get('geometry', {}).get('location', {}).get('lng')} for p in results[:10]]
         return neighbors
     except Exception as e:
         st.warning(f"Google Places API hatası: {e}"); return []
 
-
 # ------------------------------------------------------------------------------
-# 3. ARAYÜZ VE ANA İŞLEM AKIŞI (Değişiklik yok)
+# 3. ARAYÜZ VE ANA İŞLEM AKIŞI
 # ------------------------------------------------------------------------------
 st.sidebar.header("Tek Olay Analizi")
 run_analysis = st.sidebar.button("En Son Önemli Olayı Bul ve Analiz Et", type="primary", use_container_width=True)
-st.sidebar.caption("En güncel ve önemli tek bir olayı bulur, metnini çeker, derinlemesine analiz eder ve sunar.")
+st.sidebar.caption("En güncel olayı bulur, içeriğini özetler ve detaylı analiz eder.")
 
 if run_analysis:
     if not client:
@@ -129,32 +107,31 @@ if run_analysis:
 
     report = None
     with st.status("Akıllı Analiz süreci yürütülüyor...", expanded=True) as status:
-        status.write("Aşama 1: Haber kaynakları taranıyor...")
+        status.write("Aşama 1/4: Haber kaynakları taranıyor...")
         event_candidate = get_latest_event_candidate_from_rss()
-        
         if not event_candidate:
             status.update(label="Hata! Uygun bir olay adayı bulunamadı.", state="error"); st.stop()
         
         status.write(f"Olay Adayı Bulundu: **{event_candidate['headline']}**")
-        status.write(f"Aşama 2: Haber metni '{event_candidate['url']}' adresinden çekiliyor...")
+        status.write(f"Aşama 2/4: 'Araştırmacı AI' çalışıyor: '{event_candidate['url']}' adresindeki haberin içeriği özetleniyor...")
         
-        article_text = scrape_article_text(event_candidate['url'])
-        
-        if "Metin çekilemedi" in article_text:
-            status.update(label=f"Hata! Haber metni çekilemedi. Detay: {article_text}", state="error"); st.stop()
-        
-        status.write("Aşama 3: AI Analiz Motoru çalıştırılıyor: Çekilen metin ve X üzerinde analiz başlıyor...")
-        report = get_detailed_report(client, event_candidate['headline'], event_candidate['url'], article_text)
+        summary_text = get_summary_from_url(client, event_candidate['url'])
+        if not summary_text:
+            status.update(label="Hata! Haber metni AI tarafından özetlenemedi.", state="error"); st.stop()
+
+        status.write("Aşama 3/4: 'Analist AI' çalışıyor: Özetlenmiş metinden detaylı rapor oluşturuluyor...")
+        report = get_detailed_report_from_summary(client, event_candidate['headline'], summary_text)
         
         if report:
-            status.write("Aşama 4: Rapor zenginleştiriliyor: Google Maps'ten komşu tesis verileri çekiliyor...")
+            report['kaynak_urller'] = [event_candidate['url']] # Orijinal linki ekle
+            status.write("Aşama 4/4: Rapor zenginleştiriliyor: Google Maps'ten komşu tesis verileri çekiliyor...")
             report['komsu_tesisler_harita'] = find_neighboring_facilities(google_api_key, report.get('latitude'), report.get('longitude'))
             status.update(label="Analiz Başarıyla Tamamlandı!", state="complete", expanded=False)
         else:
             status.update(label="Analiz Başarısız Oldu!", state="error")
 
     if report:
-        # ... (Raporu gösterme kodu önceki versiyonla aynı)
+        # Raporu gösterme kodu (v24 ile büyük ölçüde aynı)
         st.markdown("---")
         st.header(f"Analiz Raporu: {report.get('tesis_adi', 'İsimsiz Tesis')}")
         if report.get('gorsel_url'):
@@ -168,11 +145,10 @@ if run_analysis:
             st.success(f"**Yapılan Müdahale:** {report.get('yapilan_mudahale', 'N/A')}")
             st.error(f"**Güncel Durum:** {report.get('guncel_durum', 'N/A')}")
         col3, col4 = st.columns(2)
-        with col3:
-            st.metric(label="Maddi Hasar Tahmini", value=report.get('maddi_hasar_tahmini', 'Tespit Edilemedi'))
-        with col4:
-            st.metric(label="Kar Kaybı Tahmini", value=report.get('kar_kaybi_tahmini', 'Tespit Edilemedi'))
+        with col3: st.metric(label="Maddi Hasar Tahmini", value=report.get('maddi_hasar_tahmini', 'Tespit Edilemedi'))
+        with col4: st.metric(label="Kar Kaybı Tahmini", value=report.get('kar_kaybi_tahmini', 'Tespit Edilemedi'))
         st.info(f"**Çevreye Etki:** {report.get('cevreye_etki', 'Tespit Edilemedi.')}")
+
         with st.expander("Harita, Komşu Tesisler ve Kaynakları Görüntüle", expanded=True):
             lat, lon = report.get('latitude'), report.get('longitude')
             if lat and lon:
@@ -182,14 +158,15 @@ if run_analysis:
                     neighbors = report.get('komsu_tesisler_harita', [])
                     for neighbor in neighbors:
                         if neighbor.get('lat') and neighbor.get('lng'):
-                            folium.Marker([neighbor['lat'], neighbor['lng']], popup=f"<b>{neighbor['tesis_adi']}</b><br><i>Tip: {neighbor['tip']}</i>", tooltip=neighbor['tesis_adi'], icon=folium.Icon(color='blue', icon='industry', prefix='fa')).add_to(m)
+                            folium.Marker([neighbor['lat'], neighbor['lng']], popup=f"<b>{neighbor['tesis_adi']}</b>", tooltip=neighbor['tesis_adi'], icon=folium.Icon(color='blue', icon='industry', prefix='fa')).add_to(m)
                     folium_static(m, height=500)
                 except (ValueError, TypeError): st.warning("Geçersiz koordinat formatı.")
             else:
                 st.info("Rapor, harita çizimi için yeterli koordinat bilgisi içermiyor.")
+
             st.markdown("##### Komşu Tesisler (Google Harita Verisi)")
             st.table(pd.DataFrame(report.get('komsu_tesisler_harita', [])))
             st.markdown("##### Kaynak Linkler")
             for link in report.get('kaynak_urller', []): st.markdown(f"- {link}")
 else:
-    st.info("Başlamak için lütfen kenar çubuğundaki butona tıklayarak en son olayın analizini başlatın.")
+    st.info("Başlamak için lütfen kenar çubuğundaki butona tıklayarak analiz sürecini başlatın.")
