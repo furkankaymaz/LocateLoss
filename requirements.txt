@@ -3,5 +3,4 @@ pandas
 folium
 openai
 requests
-SQLAlchemy
 feedparser
