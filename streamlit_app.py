@@ -1,132 +1,123 @@
-# ==============================================================================
-#      NİHAİ KOD (v18.1): Temiz Başlangıç - Sadece Analiz Motoru
-# ==============================================================================
 import streamlit as st
-import pandas as pd
+import requests
+import json
 import folium
 from streamlit_folium import folium_static
-from openai import OpenAI
-import json
-import re
-import requests
+from geopy.geocoders import Nominatim
+import googlemaps
+import pandas as pd
 
-# ------------------------------------------------------------------------------
-# 1. TEMEL AYARLAR VE BAĞLANTILAR
-# ------------------------------------------------------------------------------
-st.set_page_config(layout="wide", page_title="Endüstriyel Hasar Analizi")
-st.title("🛰️ Akıllı Endüstriyel Hasar Analiz Motoru (Test Modu)")
+# Grok API ayarları (kullanıcının entegrasyonu mevcut)
+GROK_API_URL = "https://api.grok.x.ai/v1/chat/completions"  # Grok API endpoint'i (doğru URL'yi kullanın)
+GROK_API_KEY = st.secrets["GROK_API_KEY"]  # Streamlit secrets'ta saklayın veya environment variable
 
-# --- API Bağlantıları ---
-grok_api_key = st.secrets.get("GROK_API_KEY")
-google_api_key = st.secrets.get("GOOGLE_MAPS_API_KEY")
-client = OpenAI(api_key=grok_api_key, base_url="https://api.x.ai/v1") if grok_api_key else None
+# Google Maps API anahtarı
+GMAPS_API_KEY = st.secrets["GMAPS_API_KEY"]  # Secrets'ta saklayın
 
-# ------------------------------------------------------------------------------
-# 2. ÇEKİRDEK FONKSİYONLAR
-# ------------------------------------------------------------------------------
+# Geocoder
+geolocator = Nominatim(user_agent="impact_map_app")
 
-@st.cache_data(ttl=600) # 10 dakikalık cache
-def get_single_latest_event(_client):
-    prompt = f"""
-    Sen, Türkiye odaklı çalışan, elit seviye bir sigorta ve risk istihbarat analistisin. Görevinin merkezinde doğruluk, kanıt ve derinlemesine detay vardır. Yüzeysel özetler kabul edilemez.
-
-    ANA GÖREVİN: Web'i (haber ajansları) ve X'i (Twitter) aktif olarak tarayarak Türkiye'de son 10 gün içinde meydana gelmiş, sigortacılık açısından **en önemli ve en güncel TEK BİR** endüstriyel veya enerji tesisi hasar olayını bul.
-
-    KRİTİK TALİMATLAR:
-    1.  **DERİNLEMESİNE BİLGİ TOPLA:** Sadece başlıkları değil, bulduğun haber metinlerinin ve X paylaşımlarının içeriğini OKU.
-    2.  **KAYNAK GÖSTERME ZORUNLUDUR:** Özellikle tesis adı ve hasar tahmini gibi kritik bilgiler için kaynağını belirt. (Örn: "Tesis Adı: ABC Kimya A.Ş. (Kaynak: X kullanıcısı @... ve DHA haberi)").
-
-    ÇIKTI FORMATI: Bulgularını, aşağıdaki detaylı anahtarlara sahip TEK BİR JSON nesnesi olarak döndür. Dizi ([]) içinde değil, doğrudan nesne ({}) olarak.
-    
-    JSON NESNE YAPISI:
-    - "event_key": Olayı benzersiz kılan bir anahtar kelime (Örn: "Gebze_Kimya_Yangini_2025_09_20").
-    - "tesis_adi": Yüksek doğrulukla tespit edilmiş ticari unvan.
-    - "tesis_adi_kaynak": Tesis adını hangi kaynaklara dayanarak bulduğunun açıklaması.
-    - "sehir_ilce": Olayın yaşandığı yer.
-    - "olay_tarihi": Olayın tarihi (YYYY-AA-GG formatında).
-    - "hasarin_nedeni": Olayın tahmini nedeni (Örn: "Elektrik panosundaki kısa devre").
-    - "hasarin_fiziksel_boyutu": Hasarın fiziksel etkisi (Örn: "Fabrikanın 5000 metrekarelik depo bölümü tamamen yandı.").
-    - "yapilan_mudahale": Resmi kurumların müdahalesi (Örn: "Olay yerine 15 itfaiye aracı sevk edildi.").
-    - "hasar_tahmini_parasal": Parasal hasar bilgisi ve kaynağı (Örn: "İlk belirlemelere göre 25 Milyon TL. Kaynak: Şirket sahibinin açıklaması.").
-    - "guncel_durum": Üretim durdu mu, soruşturma başladı mı gibi en son bilgiler.
-    - "komsu_tesisler_metin": Haber metinlerinde, olayın komşu tesislere olan etkisinden bahsediliyor mu?
-    - "latitude": Olay yerinin enlemi (Sadece sayı, tahmin de olabilir).
-    - "longitude": Olay yerinin boylamı (Sadece sayı, tahmin de olabilir).
-    - "analiz_guveni": Bu rapordaki bilgilerin genel güvenilirliğine 1-5 arası verdiğin puan.
-    - "analiz_sureci_ozeti": Bu raporu hazırlarken hangi adımları attığının kısa özeti.
-    - "kaynak_urller": Kullandığın tüm haber ve X linklerinin listesi (dizi).
-    """
-    try:
-        response = client.chat.completions.create(model="grok-4-fast-reasoning", messages=[{"role": "user", "content": prompt}], max_tokens=4096, temperature=0.1)
-        content = response.choices[0].message.content
-        match = re.search(r'\{.*\}', content, re.DOTALL)
-        return json.loads(match.group(0)) if match else None
-    except Exception as e:
-        st.error(f"Ana Analiz Motorunda Hata: {e}"); return None
-
-@st.cache_data(ttl=86400)
-def find_neighboring_facilities(api_key, lat, lon, radius=500):
-    if not api_key or not lat or not lon: return []
-    try:
-        url = f"https://maps.googleapis.com/maps/api/place/nearbysearch/json?location={float(lat)},{float(lon)}&radius={radius}&type=establishment&keyword=fabrika|depo|sanayi|tesis|lojistik|antrepo&key={api_key}"
-        response = requests.get(url)
-        results = response.json().get('results', [])
-        return [{"tesis_adi": p.get('name'), "tip": ", ".join(p.get('types', [])), "konum": p.get('vicinity')} for p in results[:10]]
-    except Exception as e:
-        st.warning(f"Google Places API hatası: {e}"); return []
-
-# ------------------------------------------------------------------------------
-# 3. ARAYÜZ VE ANA İŞLEM AKIŞI
-# ------------------------------------------------------------------------------
-st.sidebar.header("Tek Olay Analizi")
-run_analysis = st.sidebar.button("En Son Önemli Olayı Analiz Et", type="primary", use_container_width=True)
-st.sidebar.caption("Web'i ve X'i tarayarak en güncel ve önemli tek bir olayı bulur, detaylı analiz eder.")
-
-if run_analysis:
-    if not client:
-        st.error("Lütfen Grok API anahtarını Streamlit Secrets'a ekleyin."); st.stop()
-
-    with st.spinner("Ana Analiz Motoru çalıştırılıyor... Bu işlem birkaç dakika sürebilir."):
-        report = get_single_latest_event(client)
-
-    if not report:
-        st.error("Analiz motoru bir olay raporu üretemedi veya uygun bir olay bulamadı.")
+def call_grok_api(query):
+    headers = {
+        "Authorization": f"Bearer {GROK_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "grok-beta",  # Veya uygun model (Grok 4 için ayarlayın)
+        "messages": [{"role": "user", "content": query}],
+        "max_tokens": 1500
+    }
+    response = requests.post(GROK_API_URL, headers=headers, json=payload)
+    if response.status_code == 200:
+        return response.json()["choices"][0]["message"]["content"]
     else:
-        st.success("Analiz başarıyla tamamlandı!")
-        
-        with st.spinner("Rapor zenginleştiriliyor: Google Maps'ten komşu tesis verileri çekiliyor..."):
-            report['komsu_tesisler_harita'] = find_neighboring_facilities(google_api_key, report.get('latitude'), report.get('longitude'))
-        
-        st.markdown("---")
-        st.header(f"Analiz Raporu: {report.get('tesis_adi', 'İsimsiz Tesis')}")
-        
-        st.markdown(f"Güven Skoru: **{report.get('analiz_guveni', 'N/A')}/5** | *AI Süreç Özeti: {report.get('analiz_sureci_ozeti', 'N/A')}*")
-        st.caption(f"Tesis Adı Kaynağı: {report.get('tesis_adi_kaynak', 'N/A')}")
-        
-        col1, col2, col3 = st.columns(3)
-        with col1: st.info(f"**Hasarın Nedeni:** {report.get('hasarin_nedeni', 'N/A')}")
-        with col2: st.success(f"**Yapılan Müdahale:** {report.get('yapilan_mudahale', 'N/A')}")
-        with col3: st.error(f"**Güncel Durum:** {report.get('guncel_durum', 'N/A')}")
+        st.error("Grok API hatası: " + response.text)
+        return None
 
-        st.warning(f"**Hasarın Fiziksel Boyutu:** {report.get('hasarin_fiziksel_boyutu', 'N/A')}")
-        st.metric(label="Parasal Hasar Tahmini", value=report.get('hasar_tahmini_parasal', 'Tespit Edilemedi'))
+def parse_grok_response(response):
+    # Basit parse: Tesisleri liste olarak çıkar (gerçekte NLP ile iyileştirin)
+    facilities = []
+    lines = response.split("\n")
+    for line in lines:
+        if "Fabrika Adı" in line or "Adres" in line:
+            # Örnek parse; gerçekte regex veya AI kullanın
+            name = line.split(":")[1].strip() if "Fabrika Adı" in line else "Bilinmeyen"
+            address = line.split(":")[1].strip() if "Adres" in line else "Bilinmeyen"
+            damage = line.split(":")[1].strip() if "Hasar" in line else "Bilinmeyen"
+            facilities.append({"name": name, "address": address, "damage": damage})
+    return facilities
 
-        with st.expander("Harita, Komşu Tesisler ve Kaynakları Görüntüle", expanded=True):
-            lat, lon = report.get('latitude'), report.get('longitude')
-            if lat and lon:
-                try:
-                    m = folium.Map(location=[float(lat), float(lon)], zoom_start=15, tiles="CartoDB positron")
-                    folium.Marker([float(lat), float(lon)], popup=f"<b>{report.get('tesis_adi')}</b>", icon=folium.Icon(color='red', icon='fire')).add_to(m)
-                    folium_static(m, height=400)
-                except (ValueError, TypeError): st.warning("Geçersiz koordinat formatı, harita çizilemiyor.")
+def get_coordinates(address):
+    location = geolocator.geocode(address + ", Türkiye")
+    if location:
+        return (location.latitude, location.longitude)
+    return None
+
+def find_neighbor_facilities(gmaps, lat, lng, radius=5000):
+    # Places API ile endüstriyel/enerji tesisleri ara
+    places = gmaps.places_nearby(
+        location=(lat, lng),
+        radius=radius,
+        keyword="fabrika OR tesis OR sanayi OR enerji"  # Türkçe filtre
+    )
+    neighbors = []
+    for place in places.get("results", []):
+        neighbors.append({
+            "name": place["name"],
+            "address": place.get("vicinity", "Bilinmeyen"),
+            "lat": place["geometry"]["location"]["lat"],
+            "lng": place["geometry"]["location"]["lng"]
+        })
+    return neighbors
+
+def create_impact_map(facilities):
+    if not facilities:
+        return None
+    m = folium.Map(location=[39.0, 35.0], zoom_start=6)  # Türkiye merkezi
+    gmaps = googlemaps.Client(key=GMAPS_API_KEY)
+    
+    for fac in facilities:
+        coords = get_coordinates(fac["address"])
+        if coords:
+            folium.Marker(
+                coords,
+                popup=f"{fac['name']} - Hasar: {fac['damage']}",
+                icon=folium.Icon(color="red")
+            ).add_to(m)
+            # Komşuları ekle
+            neighbors = find_neighbor_facilities(gmaps, coords[0], coords[1])
+            for neigh in neighbors:
+                folium.Marker(
+                    (neigh["lat"], neigh["lng"]),
+                    popup=f"Komşu: {neigh['name']} - {neigh['address']}",
+                    icon=folium.Icon(color="blue")
+                ).add_to(m)
+    
+    return m
+
+# Streamlit App
+st.title("Sigorta Risk Etki Haritası App")
+st.write("Sorgu girin, Grok API ile analiz edin, harita oluşturun.")
+
+query = st.text_area("Sorgu (örneğin: Türkiye'de son 30 günde yangın/deprem etkilenen tesisler)", height=100)
+if st.button("Analiz Et ve Harita Oluştur"):
+    with st.spinner("Grok API çağrılıyor..."):
+        response = call_grok_api(query)
+        if response:
+            st.subheader("Grok Yanıtı")
+            st.write(response)
+            
+            facilities = parse_grok_response(response)
+            if facilities:
+                st.subheader("Tespit Edilen Tesisler")
+                df = pd.DataFrame(facilities)
+                st.table(df)
+                
+                st.subheader("Etki Haritası (Kırmızı: Etkilenen, Mavi: Komşu Tesisler)")
+                impact_map = create_impact_map(facilities)
+                if impact_map:
+                    folium_static(impact_map)
+                else:
+                    st.warning("Harita için koordinat bulunamadı.")
             else:
-                st.info("Rapor, harita çizimi için yeterli koordinat bilgisi içermiyor.")
-
-            st.markdown("##### Komşu Tesis Analizi (Haber Metinlerinden)")
-            st.write(report.get('komsu_tesisler_metin', 'Metinlerde komşu tesislere dair bir bilgi bulunamadı.'))
-            
-            st.markdown("##### Komşu Tesisler (Google Harita Verisi)")
-            st.table(pd.DataFrame(report.get('komsu_tesisler_harita', [])))
-            
-            st.markdown("##### Kaynak Linkler")
-            for link in report.get('kaynak_urller', []): st.markdown(f"- {link}")
+                st.warning("Yanıtta tesis tespit edilemedi.")
