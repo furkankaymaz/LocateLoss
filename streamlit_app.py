@@ -1,5 +1,5 @@
 # ==============================================================================
-#      NİHAİ KOD (v10.0): Akıllı, Kontrollü ve Ölçeklenebilir Mimari
+#      NİHAİ KOD (v10.1): Caching Hatası Düzeltildi
 # ==============================================================================
 import streamlit as st
 import pandas as pd
@@ -11,7 +11,7 @@ import json
 import re
 import feedparser
 from urllib.parse import quote
-import requests # Google Places API için eklendi
+import requests
 
 # ------------------------------------------------------------------------------
 # 1. TEMEL AYARLAR VE API KEY'LER
@@ -48,11 +48,12 @@ def fetch_potential_events_from_rss():
 # ------------------------------------------------------------------------------
 # 3. AŞAMA 2: AKILLI ÖN ELEME (AI FİLTRE)
 # ------------------------------------------------------------------------------
+# DÜZELTME: 'client' parametresinin başına '_' eklenerek cache tarafından ignore edilmesi sağlandı.
 @st.cache_data(ttl=3600)
-def is_event_relevant(client, headline):
+def is_event_relevant(_client, headline):
     prompt = f"Bu '{headline}' başlığı, bir endüstriyel/ticari tesiste (fabrika, depo, santral vb.) meydana gelen ve fiziksel hasara (yangın, patlama, çökme vb.) yol açan bir olayı mı anlatıyor? Sadece 'EVET' veya 'HAYIR' olarak cevap ver."
     try:
-        response = client.chat.completions.create(model=SELECTED_CONFIG["model"], messages=[{"role": "user", "content": prompt}], max_tokens=5, temperature=0.0)
+        response = _client.chat.completions.create(model=SELECTED_CONFIG["model"], messages=[{"role": "user", "content": prompt}], max_tokens=5, temperature=0.0)
         answer = response.choices[0].message.content.strip().upper()
         return "EVET" in answer
     except Exception:
@@ -61,17 +62,19 @@ def is_event_relevant(client, headline):
 # ------------------------------------------------------------------------------
 # 4. AŞAMA 3: DERİN ANALİZ (X TEYİDİ VE VERİ ÇIKARMA)
 # ------------------------------------------------------------------------------
+# DÜZELTME: 'client' parametresinin başına '_' eklenerek cache tarafından ignore edilmesi sağlandı.
 @st.cache_data(ttl=3600)
-def find_company_name_on_x(client, headline):
+def find_company_name_on_x(_client, headline):
     prompt = f"Sen bir sosyal medya araştırmacısısın. Sana verdiğim şu haber başlığıyla ilgili X (Twitter) üzerinde adı geçen spesifik şirket veya ticari unvanı bul: '{headline}'. Sadece ve sadece bulduğun şirket ismini döndür. Eğer net bir isim bulamazsan 'Belirtilmemiş' yanıtını ver."
     try:
-        response = client.chat.completions.create(model=SELECTED_CONFIG["model"], messages=[{"role": "user", "content": prompt}], max_tokens=50, temperature=0.1)
+        response = _client.chat.completions.create(model=SELECTED_CONFIG["model"], messages=[{"role": "user", "content": prompt}], max_tokens=50, temperature=0.1)
         return response.choices[0].message.content.strip()
     except Exception:
         return "Belirtilmemiş"
 
+# DÜZELTME: 'client' parametresinin başına '_' eklenerek cache tarafından ignore edilmesi sağlandı.
 @st.cache_data(ttl=86400)
-def analyze_event_details(client, headline, url, confirmed_company_name):
+def analyze_event_details(_client, headline, url, confirmed_company_name):
     prompt = f"""
     Sen bir sigorta hasar eksperi ve risk analistisin. Sana verilen haberi analiz et.
     Haber Başlığı: "{headline}"
@@ -82,7 +85,7 @@ def analyze_event_details(client, headline, url, confirmed_company_name):
     JSON ANAHTARLARI: olay_tarihi_saati, guncel_durum, tesis_adi_ticari_unvan, sehir_ilce, olay_tipi_ozet, hasar_tahmini (nesne: tutar_araligi_tl, kaynak, aciklama), can_kaybi_ve_yaralilar (nesne: durum, detaylar), kaynak_linkleri (dizi), gorsel_linkleri (dizi), latitude, longitude
     """
     try:
-        response = client.chat.completions.create(model=SELECTED_CONFIG["model"], messages=[{"role": "user", "content": prompt}], max_tokens=4096, temperature=0.1)
+        response = _client.chat.completions.create(model=SELECTED_CONFIG["model"], messages=[{"role": "user", "content": prompt}], max_tokens=4096, temperature=0.1)
         content = response.choices[0].message.content.strip()
         match = re.search(r'\{.*\}', content, re.DOTALL)
         if match:
@@ -98,12 +101,15 @@ def analyze_event_details(client, headline, url, confirmed_company_name):
 # ------------------------------------------------------------------------------
 @st.cache_data(ttl=86400)
 def find_neighboring_facilities(api_key, lat, lon, radius=250):
+    if not api_key:
+        st.warning("Google Maps API anahtarı bulunamadı. Komşu tesis analizi atlanıyor.")
+        return []
     url = f"https://maps.googleapis.com/maps/api/place/nearbysearch/json?location={lat},{lon}&radius={radius}&type=establishment&keyword=fabrika|depo|sanayi|tesis|lojistik|antrepo&key={api_key}"
     try:
         response = requests.get(url)
         results = response.json().get('results', [])
         neighbors = []
-        for place in results[:5]: # En fazla 5 komşu tesisi al
+        for place in results[:5]: 
             neighbors.append({
                 "tesis_adi": place.get('name'),
                 "tip": ", ".join(place.get('types', [])),
@@ -121,15 +127,13 @@ st.sidebar.header("⚙️ Kontrol Paneli")
 event_limit = st.sidebar.number_input("Analiz Edilecek Maksimum Olay Sayısı", min_value=1, max_value=10, value=1, help="Maliyeti kontrol etmek için her çalıştırmada kaç olayın derinlemesine analiz edileceğini seçin.")
 
 if st.sidebar.button("En Son Olayları Bul ve Analiz Et", type="primary", use_container_width=True):
-    # API Anahtarlarını Kontrol Et
-    if not grok_api_key or not google_api_key:
-        st.error("Lütfen Grok ve Google API anahtarlarını Streamlit Secrets'a ekleyin.")
+    if not grok_api_key:
+        st.error("Lütfen Grok API anahtarını Streamlit Secrets'a ekleyin.")
         st.stop()
 
     client = OpenAI(api_key=grok_api_key, base_url=SELECTED_CONFIG["base_url"])
     processed_count = 0
     
-    # AŞAMA 1: Olay Tespiti
     with st.spinner("Aşama 1/5: Potansiyel olaylar haber kaynaklarından taranıyor..."):
         potential_events = fetch_potential_events_from_rss()
 
@@ -139,20 +143,17 @@ if st.sidebar.button("En Son Olayları Bul ve Analiz Et", type="primary", use_co
 
     st.info(f"{len(potential_events)} potansiyel başlık bulundu. Şimdi akıllı filtre ile eleniyor...")
     
-    # Ana Döngü
     for event in potential_events:
         if processed_count >= event_limit:
             st.success(f"İstenen olay limitine ({event_limit}) ulaşıldı. Analiz tamamlandı.")
             break
 
-        # AŞAMA 2: Akıllı Ön Eleme
         with st.spinner(f"Aşama 2/5: '{event['title'][:50]}...' filtreleniyor..."):
             if not is_event_relevant(client, event['title']):
                 continue
 
         st.success(f"✅ İlgili olay bulundu: **{event['title']}**")
         
-        # AŞAMA 3: Derin Analiz
         with st.spinner("Aşama 3/5: Firma adı X (Twitter) üzerinden teyit ediliyor..."):
             company_name = find_company_name_on_x(client, event['title'])
         
@@ -165,7 +166,6 @@ if st.sidebar.button("En Son Olayları Bul ve Analiz Et", type="primary", use_co
             st.warning("Bu olay için detay analizi başarısız oldu. Sonraki olaya geçiliyor.")
             continue
             
-        # AŞAMA 4: Coğrafi Zenginleştirme
         lat = details.get('latitude')
         lon = details.get('longitude')
         real_neighbors = []
@@ -173,7 +173,6 @@ if st.sidebar.button("En Son Olayları Bul ve Analiz Et", type="primary", use_co
             with st.spinner("Aşama 4/5: Gerçek komşu tesisler harita servisinden alınıyor..."):
                 real_neighbors = find_neighboring_facilities(google_api_key, lat, lon)
         
-        # AŞAMA 5: Raporlama
         st.subheader(f"📂 Analiz Raporu: {details.get('tesis_adi_ticari_unvan')}")
         
         col1, col2 = st.columns(2)
@@ -188,16 +187,9 @@ if st.sidebar.button("En Son Olayları Bul ve Analiz Et", type="primary", use_co
             if can_kaybi.get('durum', 'hayır').lower() == 'evet':
                 st.error(f"**Can Kaybı/Yaralı:** {can_kaybi.get('detaylar', 'Detay Yok')}")
         
-        # HARİTA
         if lat and lon:
-            m = folium.Map(location=[lat, lon], zoom_start=16)
-            # Ana Tesis
-            folium.Marker([lat, lon], popup=f"<b>{details.get('tesis_adi_ticari_unvan')}</b>", tooltip="Ana Tesis", icon=folium.Icon(color='red', icon='fire')).add_to(m)
-            # Komşu Tesisler
-            for neighbor in real_neighbors:
-                # Komşu tesislerin koordinatları API yanıtında yok, bu yüzden haritaya ekleyemeyiz.
-                # Ancak listesini aşağıda gösterebiliriz.
-                pass
+            m = folium.Map(location=[float(lat), float(lon)], zoom_start=16)
+            folium.Marker([float(lat), float(lon)], popup=f"<b>{details.get('tesis_adi_ticari_unvan')}</b>", tooltip="Ana Tesis", icon=folium.Icon(color='red', icon='fire')).add_to(m)
             folium_static(m, height=400)
 
         with st.expander("Detaylı Raporu ve Kaynakları Görüntüle"):
