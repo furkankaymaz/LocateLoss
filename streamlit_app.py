@@ -1,5 +1,5 @@
 # ==============================================================================
-#           NİHAİ KOD (v8.2): SyntaxError DÜZELTMESİ
+#      NİHAİ KOD (v8.3): Olay Bulma Mantığı İyileştirildi
 # ==============================================================================
 import streamlit as st
 import pandas as pd
@@ -49,23 +49,38 @@ else:
 # 3. İKİ AŞAMALI VERİ ÇEKME FONKSİYONLARI
 # ------------------------------------------------------------------------------
 
+# REVİZE EDİLDİ: Fonksiyon daha güvenilir sonuçlar için güncellendi.
 @st.cache_data(ttl=900)
-def find_latest_events(key, base_url, model, event_count=1): # DEBUG: event_count=1 olarak ayarlandı
+def find_latest_events(key, base_url, model, event_count=5): # Arama esnekliği için 5 olay istiyoruz.
     client = OpenAI(api_key=key, base_url=base_url)
     current_date = datetime.now().strftime('%Y-%m-%d')
-    prompt = f"""
-    Bugünün tarihi {current_date}. Türkiye'de son 3 ay içinde yaşanmış endüstriyel hasar olaylarını (fabrika yangını, patlama vb.) tara.
-    Bulduğun olaylar arasından bana **en güncel {event_count} tanesini** listele. Özellikle son 72 saatteki olaylara öncelik ver.
-    Öncelikli kaynakların X (Twitter)'daki resmi hesaplar (valilik, itfaiye) ve ulusal haber ajansları (AA, DHA) olsun.
     
-    # DÜZELTME: SyntaxError'ı önlemek için JSON örneği kaldırıldı ve tarif edildi.
-    Çıktıyı, "headline" ve "url" anahtarlarını içeren bir JSON dizisi olarak ver. Sadece listele.
+    # REVİZE EDİLDİ: Prompt basitleştirildi ve daha net hale getirildi.
+    prompt = f"""
+    Bugünün tarihi {current_date}. Görevin, Türkiye'de son 3 ay içinde meydana gelmiş önemli endüstriyel hasar olaylarını (fabrika yangını, kimyasal sızıntı, büyük patlama vb.) bulmaktır.
+    
+    Bana bulduğun olaylar arasından **en güncel {event_count} tanesinin** bir listesini ver.
+    
+    Öncelikli kaynakların X (Twitter) ve güvenilir ulusal haber ajansları (Anadolu Ajansı, Demirören Haber Ajansı vb.) olsun.
+    
+    Çıktıyı, her olay için "headline" (manşet) ve "url" (haber linki) anahtarlarını içeren bir JSON dizisi olarak döndür. Başka hiçbir açıklama veya metin ekleme. Sadece ham JSON dizisini ver.
+    Örnek: [{"headline": "...", "url": "..."}]
     """
     try:
-        response = client.chat.completions.create(model=model, messages=[{"role": "user", "content": prompt}], max_tokens=512, temperature=0.0)
+        response = client.chat.completions.create(
+            model=model, 
+            messages=[{"role": "user", "content": prompt}], 
+            max_tokens=1024, # Daha fazla olay başlığı için token artırıldı
+            temperature=0.0
+        )
         content = response.choices[0].message.content.strip()
         match = re.search(r'\[.*\]', content, re.DOTALL)
-        return json.loads(match.group(0)) if match else []
+        if match:
+            return json.loads(match.group(0))
+        else:
+            st.warning("API'den geçerli bir JSON dizisi alınamadı. Ham yanıt aşağıdadır:")
+            st.code(content) # Hata ayıklama için ham yanıtı göster
+            return []
     except Exception as e:
         st.error(f"Olay arama sırasında bir hata oluştu: {e}")
         return []
@@ -73,7 +88,6 @@ def find_latest_events(key, base_url, model, event_count=1): # DEBUG: event_coun
 @st.cache_data(ttl=86400)
 def analyze_single_event(key, base_url, model, headline, url):
     client = OpenAI(api_key=key, base_url=base_url)
-    # DÜZELTME: SyntaxError'ı önlemek için tüm JSON örnekleri kaldırıldı ve sade bir liste ile tarif edildi.
     prompt = f"""
     Sen bir sigorta hasar eksperisin. Sana verilen şu haberi analiz et: "{headline}" ({url}).
     GÖREVİN: X (Twitter) ve diğer haber ajanslarını kullanarak bu tek olayı çapraz kontrol et ve aşağıda belirtilen anahtarlara sahip TEK BİR JSON nesnesi olarak detaylı bir rapor oluştur.
@@ -98,15 +112,15 @@ def analyze_single_event(key, base_url, model, headline, url):
     try:
         response = client.chat.completions.create(model=model, messages=[{"role": "user", "content": prompt}], max_tokens=4096, temperature=0.1)
         content = response.choices[0].message.content.strip()
-        # JSON'u ayıklamak için daha sağlam bir yöntem
         match = re.search(r'\{.*\}', content, re.DOTALL)
         if match:
             return json.loads(match.group(0))
         else:
-            # Bazen modeller ```json ... ``` bloğu kullanır
             match_markdown = re.search(r'```json\s*(\{.*\})\s*```', content, re.DOTALL)
             if match_markdown:
                 return json.loads(match_markdown.group(1))
+        st.warning("Detaylı analizden geçerli bir JSON nesnesi alınamadı. Ham yanıt aşağıdadır:")
+        st.code(content)
         return None
     except Exception as e:
         st.error(f"Detaylı analiz sırasında bir hata oluştu: {e}")
@@ -118,21 +132,22 @@ def analyze_single_event(key, base_url, model, headline, url):
 st.header("📈 En Son Tespit Edilen Hasarlar (Test Modu: Son 1 Olay)")
 
 if st.button("En Son Olayı Bul ve Analiz Et", type="primary", use_container_width=True):
-    with st.spinner("1. Aşama: En son olay taranıyor..."):
+    with st.spinner("1. Aşama: Son olaylar taranıyor..."):
+        # Not: Fonksiyon 5 olay arasa da biz sadece ilkini işleyeceğiz.
         latest_events = find_latest_events(api_key, SELECTED_CONFIG["base_url"], SELECTED_CONFIG["model"])
 
     if not latest_events:
         st.info("Belirtilen kriterlere uygun, raporlanacak bir endüstriyel olay tespit edilemedi.")
     else:
-        st.success(f"**1 adet potansiyel olay bulundu.** Şimdi derinlemesine analiz ediliyor...")
+        st.success(f"**{len(latest_events)} adet potansiyel olay bulundu.** Şimdi en güncel olanı derinlemesine analiz ediliyor...")
 
-        event = latest_events[0]
+        # Analiz için sadece en güncel (listedeki ilk) olayı alıyoruz.
+        event = latest_events[0] 
         event_details = analyze_single_event(api_key, SELECTED_CONFIG["base_url"], SELECTED_CONFIG["model"], event.get('headline'), event.get('url'))
 
         if not event_details:
-            st.warning("Olay bulundu ancak detaylı analiz sırasında bir sorun oluştu veya analiz sonucu geçerli formatta değildi.")
+            st.error("Olay bulundu ancak detaylı analiz sırasında bir sorun oluştu veya analiz sonucu geçerli formatta değildi.")
         else:
-            # Raporlama ve Haritalama (Önceki kodla aynı, hatasız çalışması beklenir)
             events_df = pd.DataFrame([event_details])
             events_df['olay_tarihi_saati'] = pd.to_datetime(events_df['olay_tarihi_saati'], errors='coerce')
             st.subheader("Analiz Edilen Son Olay Raporu")
@@ -160,11 +175,19 @@ if st.button("En Son Olayı Bul ve Analiz Et", type="primary", use_container_wid
 
                 with col2:
                     st.markdown("##### Çevre Tesisler İçin Risk Analizi")
-                    st.table(pd.DataFrame(row.get('cevre_tesis_analizi',[])))
+                    cevre_tesis_data = row.get('cevre_tesis_analizi',[])
+                    if cevre_tesis_data:
+                        st.table(pd.DataFrame(cevre_tesis_data))
+                    else:
+                        st.write("Çevre tesis riski belirtilmemiş.")
                 
                 st.markdown("---"); st.markdown("##### Tıklanabilir Kaynak Linkleri")
-                links_md = "".join([f"- [{link.split('//')[-1].split('/')[0]}]({link})\n" for link in row.get('kaynak_linkleri', [])])
-                st.markdown(links_md)
+                kaynak_linkleri = row.get('kaynak_linkleri', [])
+                if kaynak_linkleri:
+                    links_md = "".join([f"- [{link.split('//')[-1].split('/')[0]}]({link})\n" for link in kaynak_linkleri])
+                    st.markdown(links_md)
+                else:
+                    st.write("Kaynak link bulunamadı.")
             
             st.header("🗺️ Olay Yeri İncelemesi")
             map_df = events_df.dropna(subset=['latitude', 'longitude'])
