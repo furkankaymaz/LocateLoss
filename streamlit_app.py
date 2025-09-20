@@ -1,3 +1,6 @@
+# ==============================================================================
+#           NİHAİ KOD (v3): DOĞRU MODEL ADI İLE GÜNCELLENDİ
+# ==============================================================================
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
@@ -7,14 +10,16 @@ from openai import OpenAI
 import json
 import re
 
-# Sayfa Genişliğini Ayarlama
+# ------------------------------------------------------------------------------
+# 1. TEMEL AYARLAR VE API ANAHTARI KONTROLÜ
+# ------------------------------------------------------------------------------
+
 st.set_page_config(layout="wide")
 st.title("🚨 Endüstriyel Hasar Analiz Paneli")
 st.markdown("---")
 
-# --- KULLANICI AYARI ---
-# API Servis Bilgileri
 API_SERVICE = "Grok_XAI" 
+
 API_CONFIGS = {
     "Groq": {
         "base_url": "https://api.groq.com/openai/v1",
@@ -22,34 +27,34 @@ API_CONFIGS = {
     },
     "Grok_XAI": {
         "base_url": "https://api.x.ai/v1",
-        "model": "grok-beta",  # Revize: Erişilebilir model (grok-1 yerine grok-beta veya grok-3)
+        # !!! GÜNCELLEME: Hesabınızda bulunan ve görev için en uygun
+        # !!! model olan "grok-4-fast-reasoning" seçildi.
+        "model": "grok-4-fast-reasoning", 
     }
 }
 SELECTED_CONFIG = API_CONFIGS[API_SERVICE]
-API_KEY_NAME = "GROK_API_KEY" # Streamlit Secrets'teki anahtar adı
+API_KEY_NAME = "GROK_API_KEY"
 
-# Secrets'ten API anahtarını güvenli bir şekilde çekelim
 api_key = st.secrets.get(API_KEY_NAME)
 
 # ------------------------------------------------------------------------------
 # 2. API ANAHTARINI DOĞRULAMA FONKSİYONU
-#    Bu fonksiyon, anahtarın geçerli olup olmadığını her zaman kontrol eder.
 # ------------------------------------------------------------------------------
 
-@st.cache_data(ttl=3600) # Testi saatte bir tekrarla
+@st.cache_data(ttl=3600)
 def validate_api_key(key, base_url, model):
     if not key:
         return False, f"**{API_KEY_NAME}** adında bir anahtar Streamlit Secrets içinde bulunamadı.", "Lütfen Streamlit Cloud'da uygulamanızın 'Settings > Secrets' bölümüne giderek anahtarınızı ekleyin."
     try:
         client = OpenAI(api_key=key, base_url=base_url)
         client.chat.completions.create(model=model, messages=[{"role": "user", "content": "Merhaba"}], max_tokens=10)
-        return True, f"API anahtarı doğrulandı ve **{API_SERVICE}** servisine başarıyla bağlandı!", ""
+        return True, f"API anahtarı doğrulandı ve **{API_SERVICE} ({model})** servisine başarıyla bağlandı!", ""
     except Exception as e:
         error_message = str(e)
-        if "404" in error_message or "model" in error_message.lower():
-            return False, "Model erişimi yok (Hata 404).", f"Model '{model}' mevcut değil veya takımınıza erişim yok. x.ai console'dan model erişimini kontrol edin (grok-beta veya grok-3 deneyin)."
-        elif "401" in error_message:
+        if "401" in error_message:
             return False, "API Anahtarı Geçersiz (Hata 401).", f"Streamlit Secrets'e eklediğiniz anahtar **{API_SERVICE}** servisi tarafından reddedildi. Lütfen anahtarın doğru olduğundan ve bu servise ait olduğundan emin olun."
+        elif "404" in error_message and "does not exist" in error_message:
+            return False, f"Model Bulunamadı (Hata 404).", f"İstenen '{model}' modeli mevcut değil veya hesabınızın bu modele erişim izni yok. Lütfen x.ai hesabınızdan doğru model adını kontrol edip koddaki 'model' alanını güncelleyin."
         else:
             return False, "Bilinmeyen bir API hatası oluştu.", f"Hata detayı: {error_message}"
 
@@ -57,7 +62,6 @@ def validate_api_key(key, base_url, model):
 # 3. UYGULAMA AKIŞI: ÖNCE TEST ET, SONRA ÇALIŞTIR
 # ------------------------------------------------------------------------------
 
-# API anahtarını doğrula ve sonucu ekranda her zaman göster
 st.subheader("⚙️ API Bağlantı Durumu")
 is_valid, status_message, solution_message = validate_api_key(api_key, SELECTED_CONFIG["base_url"], SELECTED_CONFIG["model"])
 
@@ -66,13 +70,13 @@ if is_valid:
 else:
     st.error(f"❌ **HATA:** {status_message}")
     st.warning(f"👉 **ÇÖZÜM ÖNERİSİ:** {solution_message}")
-    st.stop() # Hata varsa uygulamayı burada durdur
+    st.stop()
 
 # --- Buradan Sonrası Sadece API Testi Başarılı Olduğunda Çalışır ---
 st.markdown("---")
 st.header("Son 30 Günlük Endüstriyel Hasar Raporu")
 
-@st.cache_data(ttl=43200) # Verileri 12 saatte bir yeniden çek
+@st.cache_data(ttl=43200)
 def get_industrial_events(key, base_url, model):
     client = OpenAI(api_key=key, base_url=base_url)
     start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
@@ -103,25 +107,16 @@ if st.button("Analizi Başlat (Son 30 Gün)", type="primary"):
 
     if not events_df.empty:
         st.success(f"{len(events_df)} adet önemli olay tespit edildi.")
-        
         st.subheader("Tespit Edilen Olaylar Listesi")
         st.dataframe(events_df)
-
         st.subheader("Olayların Harita Üzerinde Gösterimi")
         map_df = events_df.dropna(subset=['latitude', 'longitude'])
-
         if not map_df.empty:
             map_center = [map_df['latitude'].mean(), map_df['longitude'].mean()]
             m = folium.Map(location=map_center, zoom_start=6)
-
             for _, row in map_df.iterrows():
                 popup_html = f"<b>Tesis:</b> {row['tesis_adi_turu']}<br><b>Tarih:</b> {row['olay_tarihi'].strftime('%Y-%m-%d')}<br><b>Etki:</b> {str(row['hasar_etkisi'])[:200]}..."
-                folium.Marker(
-                    [row['latitude'], row['longitude']],
-                    popup=folium.Popup(popup_html, max_width=350),
-                    tooltip=row['tesis_adi_turu']
-                ).add_to(m)
-            
+                folium.Marker([row['latitude'], row['longitude']], popup=folium.Popup(popup_html, max_width=350), tooltip=row['tesis_adi_turu']).add_to(m)
             folium_static(m, width=1100, height=600)
         else:
             st.warning("Harita üzerinde gösterilecek geçerli konum verisi bulunamadı.")
