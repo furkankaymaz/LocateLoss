@@ -1,5 +1,5 @@
 # ==============================================================================
-#      NİHAİ KOD (v24.0): Adım Adım Teyit Mimarisi
+#      NİHAİ KOD (v25.0): Veri Çekme (Scraping) + Derin Analiz Mimarisi
 # ==============================================================================
 import streamlit as st
 import pandas as pd
@@ -11,6 +11,7 @@ import re
 import requests
 import feedparser
 from urllib.parse import quote
+from bs4 import BeautifulSoup
 
 # ------------------------------------------------------------------------------
 # 1. TEMEL AYARLAR
@@ -27,6 +28,7 @@ client = OpenAI(api_key=grok_api_key, base_url="https://api.x.ai/v1") if grok_ap
 # 2. ÇEKİRDEK FONKSİYONLAR
 # ------------------------------------------------------------------------------
 
+# Adım 1: Otomatik Keşif - En son olayı bulur
 @st.cache_data(ttl=600)
 def get_latest_event_candidate_from_rss():
     search_query = '("fabrika yangını" OR "sanayi tesisi" OR "OSB yangın" OR "liman kaza" OR "depo patlaması" OR "enerji santrali")'
@@ -40,44 +42,62 @@ def get_latest_event_candidate_from_rss():
     except Exception as e:
         st.error(f"RSS haber kaynağına erişilirken hata oluştu: {e}"); return None
 
-# YENİ ADIM 1: "Dedektif" AI - Sadece Tesis Adını ve Kanıtını Bulur
+# YENİ Adım 2: Veri Çekme - Haberin metnini internetten okur
 @st.cache_data(ttl=3600)
-def find_company_name_with_proof(_client, event_candidate):
-    prompt = f"""
-    Sen bir istihbarat dedektifisin. Tek bir görevin var: '{event_candidate['headline']}' başlıklı ve '{event_candidate['url']}' adresindeki haberde adı geçen **spesifik ticari unvanı (şirket adını)** bulmak.
-    
-    1.  Öncelikle X (Twitter)'da haber başlığındaki anahtar kelimelerle arama yap. Genellikle gazeteciler veya resmi hesaplar şirket adını burada verir.
-    2.  Bulamazsan, haber metnini dikkatlice oku.
-    3.  Bulduğun şirket adını ve bu adı bulduğun **orijinal cümlenin birebir alıntısını (kanıt)** bir JSON nesnesi olarak döndür.
-    4.  Eğer %95 emin değilsen veya isim bulamazsan, 'tesis_adi' alanına 'Tespit Edilemedi' yaz. ASLA İSİM UYDURMA.
-
-    ÇIKTI FORMATI: {{"tesis_adi": "...", "kanit": "..."}}
-    """
+def scrape_article_text(url):
     try:
-        response = _client.chat.completions.create(model="grok-4-fast-reasoning", messages=[{"role": "user", "content": prompt}], max_tokens=1024, temperature=0.0)
-        content = response.choices[0].message.content
-        match = re.search(r'\{.*\}', content, re.DOTALL)
-        return json.loads(match.group(0)) if match else {"tesis_adi": "Tespit Edilemedi", "kanit": "AI yanıt formatı bozuk."}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status() # HTTP hatalarını kontrol et
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Haber metnini bulmak için genel seçiciler (selector)
+        content_selectors = ['div.story-body', 'div.article-content', 'div.content', 'article']
+        main_content = None
+        for selector in content_selectors:
+            main_content = soup.select_one(selector)
+            if main_content:
+                break
+        
+        if not main_content:
+            main_content = soup.body # Hiçbir şey bulunamazsa body'yi al
+        
+        paragraphs = main_content.find_all('p')
+        full_text = "\n".join([p.get_text(strip=True) for p in paragraphs])
+        return full_text if full_text else "Metin çekilemedi."
     except Exception as e:
-        st.error(f"Dedektif AI hatası: {e}"); return None
+        st.warning(f"Haber metni çekilirken hata oluştu: {e}")
+        return "Metin çekilemedi."
 
-# YENİ ADIM 2: "Analist" AI - Teyit Edilmiş Bilgiyle Raporu Doldurur
+# Adım 3: Derin Analiz - Çekilmiş veri üzerinden AI'ı çalıştırır
 @st.cache_data(ttl=3600)
-def get_detailed_report(_client, event_candidate, verified_name, proof):
+def get_detailed_report(_client, headline, url, article_text):
     prompt = f"""
-    Sen elit bir sigorta istihbarat analistisin. Analiz edeceğin olayın ana tesisi teyit edildi.
-    - Teyit Edilmiş Tesis Adı: **{verified_name}**
-    - Kanıt: *"{proof}"*
-    - Haber Linki: {event_candidate['url']}
+    Sen, Türkiye odaklı, kanıta dayalı ve aşırı detaycı bir sigorta istihbarat analistisin.
+    
+    ANA GÖREVİN: Sana aşağıda tam metnini verdiğim haberi ve başlığını analiz et.
+    - BAŞLIK: "{headline}"
+    - HABER METNİ: "{article_text[:4000]}"
 
-    GÖREVİN: Bu teyit edilmiş bilgi ışığında, verdiğim linkteki haberi ve web'deki diğer kaynakları kullanarak aşağıdaki tüm detayları içeren zengin bir JSON raporu oluştur.
+    İKİNCİL GÖREVİN: Yukarıdaki metinden bulduğun kilit isimler (potansiyel tesis adı, şehir vb.) ile **X (Twitter) üzerinde ek bir arama yaparak** bilgileri doğrula, ek detay, görgü tanığı ve kanıt bul.
+
+    NİHAİ HEDEF: Topladığın TÜM bilgileri (verilen haber metni ve X'ten buldukların) birleştirerek, aşağıdaki JSON formatında, mümkün olan en detaylı ve dolu raporu oluştur.
     
     JSON NESNE YAPISI:
-    - "sehir_ilce", "olay_tarihi", "hasarin_nedeni", "hasarin_fiziksel_boyutu", "yapilan_mudahale",
-    - "hasar_tahmini_detay": Maddi hasar ve/veya kar kaybı tahmini ve kaynağı.
-    - "guncel_durum", "cevreye_etki", "latitude", "longitude",
+    - "tesis_adi": Yüksek doğrulukla tespit edilmiş ticari unvan.
+    - "tesis_adi_kanit": Tesis adının geçtiği cümlenin veya X paylaşımının doğrudan alıntısı.
+    - "sehir_ilce": Olayın yaşandığı yer.
+    - "olay_tarihi": Olayın tarihi (YYYY-AA-GG).
+    - "hasarin_nedeni": Olayın tahmini nedeni.
+    - "hasarin_fiziksel_boyutu": Hasarın fiziksel etkisi (yüzölçümü, etkilenen birimler).
+    - "maddi_hasar_tahmini": Parasal maddi hasar bilgisi ve kaynağı.
+    - "kar_kaybi_tahmini": Üretim durması kaynaklı kar kaybı bilgisi ve kaynağı.
+    - "yapilan_mudahale": Resmi kurumların müdahalesi (itfaiye sayısı, süre).
+    - "guncel_durum": Üretim durdu mu, soruşturma başladı mı gibi en son bilgiler.
+    - "cevreye_etki": Duman, sızıntı gibi çevreye olan etkilerin özeti.
+    - "latitude", "longitude": Olay yerinin spesifik koordinatları (tahmin de olabilir).
     - "gorsel_url": Olayla ilgili en net fotoğrafın doğrudan URL'si (.jpg, .png).
-    - "kaynak_urller": Kullandığın tüm linklerin listesi.
+    - "kaynak_urller": Kullandığın tüm haber ve X linklerinin listesi.
     """
     try:
         response = _client.chat.completions.create(model="grok-4-fast-reasoning", messages=[{"role": "user", "content": prompt}], max_tokens=4096, temperature=0.1)
@@ -85,11 +105,11 @@ def get_detailed_report(_client, event_candidate, verified_name, proof):
         match = re.search(r'\{.*\}', content, re.DOTALL)
         return json.loads(match.group(0)) if match else None
     except Exception as e:
-        st.error(f"Analist AI hatası: {e}"); return None
+        st.error(f"Derin Analiz Motorunda Hata: {e}"); return None
 
+# Adım 4: Coğrafi Zenginleştirme
 @st.cache_data(ttl=86400)
 def find_neighboring_facilities(api_key, lat, lon, radius=500):
-    #... (Bu fonksiyon aynı kalıyor)
     if not api_key or not lat or not lon: return []
     try:
         url = f"https://maps.googleapis.com/maps/api/place/nearbysearch/json?location={float(lat)},{float(lon)}&radius={radius}&type=establishment&keyword=fabrika|depo|sanayi|tesis|lojistik|antrepo&key={api_key}"
@@ -108,7 +128,7 @@ def find_neighboring_facilities(api_key, lat, lon, radius=500):
 # ------------------------------------------------------------------------------
 st.sidebar.header("Tek Olay Analizi")
 run_analysis = st.sidebar.button("En Son Önemli Olayı Bul ve Analiz Et", type="primary", use_container_width=True)
-st.sidebar.caption("En güncel ve önemli tek bir olayı bulur, adını teyit eder ve detaylı analiz eder.")
+st.sidebar.caption("En güncel ve önemli tek bir olayı bulur, metnini çeker, derinlemesine analiz eder ve sunar.")
 
 if run_analysis:
     if not client:
@@ -116,36 +136,29 @@ if run_analysis:
 
     report = None
     with st.status("Akıllı Analiz süreci yürütülüyor...", expanded=True) as status:
-        status.write("Aşama 1: Haber kaynakları taranıyor ve en güncel olay adayı bulunuyor...")
+        status.write("Aşama 1: Haber kaynakları taranıyor...")
         event_candidate = get_latest_event_candidate_from_rss()
         
         if not event_candidate:
             status.update(label="Hata! Uygun bir olay adayı bulunamadı.", state="error"); st.stop()
         
         status.write(f"Olay Adayı Bulundu: **{event_candidate['headline']}**")
-        status.write("Aşama 2: 'Dedektif AI' çalıştırılıyor: Tesis adı ve kanıt aranıyor...")
+        status.write(f"Aşama 2: Haber metni '{event_candidate['url']}' adresinden çekiliyor...")
         
-        name_proof = find_company_name_with_proof(client, event_candidate)
-
-        if not name_proof or name_proof.get('tesis_adi') == 'Tespit Edilemedi':
-            status.update(label="Tesis Adı Bulunamadı!", state="error")
-            st.error(f"Bu olay için spesifik bir tesis adı teyit edilemedi. Kanıt: {name_proof.get('kanit', 'N/A')}")
+        article_text = scrape_article_text(event_candidate['url'])
+        
+        if "Metin çekilemedi" in article_text:
+            status.update(label="Hata! Haber metni çekilemedi.", state="error"); st.stop()
+        
+        status.write("Aşama 3: AI Analiz Motoru çalıştırılıyor: Çekilen metin ve X üzerinde analiz başlıyor...")
+        report = get_detailed_report(client, event_candidate['headline'], event_candidate['url'], article_text)
+        
+        if report:
+            status.write("Aşama 4: Rapor zenginleştiriliyor: Google Maps'ten komşu tesis verileri çekiliyor...")
+            report['komsu_tesisler_harita'] = find_neighboring_facilities(google_api_key, report.get('latitude'), report.get('longitude'))
+            status.update(label="Analiz Başarıyla Tamamlandı!", state="complete", expanded=False)
         else:
-            verified_name = name_proof['tesis_adi']
-            proof = name_proof['kanit']
-            status.write(f"Tesis Adı Teyit Edildi: **{verified_name}**")
-            status.write("Aşama 3: 'Analist AI' çalıştırılıyor: Detaylı rapor oluşturuluyor...")
-
-            report = get_detailed_report(client, event_candidate, verified_name, proof)
-            
-            if report:
-                report['tesis_adi'] = verified_name # Teyit edilmiş ismi rapora ekle
-                report['tesis_adi_kanit'] = proof
-                status.write("Aşama 4: Rapor zenginleştiriliyor: Google Maps'ten komşu tesis verileri çekiliyor...")
-                report['komsu_tesisler_harita'] = find_neighboring_facilities(google_api_key, report.get('latitude'), report.get('longitude'))
-                status.update(label="Analiz Başarıyla Tamamlandı!", state="complete")
-            else:
-                status.update(label="Detaylı Analiz Başarısız Oldu!", state="error")
+            status.update(label="Analiz Başarısız Oldu!", state="error")
 
     if report:
         st.markdown("---")
@@ -164,11 +177,15 @@ if run_analysis:
             st.success(f"**Yapılan Müdahale:** {report.get('yapilan_mudahale', 'N/A')}")
             st.error(f"**Güncel Durum:** {report.get('guncel_durum', 'N/A')}")
 
-        st.metric(label="Maddi Hasar ve/veya Kar Kaybı Tahmini", value=report.get('hasar_tahmini_detay', 'Tespit Edilemedi'))
+        col3, col4 = st.columns(2)
+        with col3:
+            st.metric(label="Maddi Hasar Tahmini", value=report.get('maddi_hasar_tahmini', 'Tespit Edilemedi'))
+        with col4:
+            st.metric(label="Kar Kaybı Tahmini", value=report.get('kar_kaybi_tahmini', 'Tespit Edilemedi'))
+        
         st.info(f"**Çevreye Etki:** {report.get('cevreye_etki', 'Tespit Edilemedi.')}")
 
         with st.expander("Harita, Komşu Tesisler ve Kaynakları Görüntüle", expanded=True):
-            # ... Harita ve komşu tesis gösterme kodu (v23 ile aynı)
             lat, lon = report.get('latitude'), report.get('longitude')
             if lat and lon:
                 try:
