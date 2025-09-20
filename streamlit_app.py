@@ -1,5 +1,5 @@
 # ==============================================================================
-#           NİHAİ KOD (v3): DOĞRU MODEL ADI İLE GÜNCELLENDİ
+#           NİHAİ KOD (v4): GELİŞMİŞ PROMPT VE "SON 10 OLAY" MANTIĞI
 # ==============================================================================
 import streamlit as st
 import pandas as pd
@@ -27,8 +27,6 @@ API_CONFIGS = {
     },
     "Grok_XAI": {
         "base_url": "https://api.x.ai/v1",
-        # !!! GÜNCELLEME: Hesabınızda bulunan ve görev için en uygun
-        # !!! model olan "grok-4-fast-reasoning" seçildi.
         "model": "grok-4-fast-reasoning", 
     }
 }
@@ -50,11 +48,12 @@ def validate_api_key(key, base_url, model):
         client.chat.completions.create(model=model, messages=[{"role": "user", "content": "Merhaba"}], max_tokens=10)
         return True, f"API anahtarı doğrulandı ve **{API_SERVICE} ({model})** servisine başarıyla bağlandı!", ""
     except Exception as e:
+        # Hata mesajlarını daha kullanıcı dostu hale getirelim
         error_message = str(e)
         if "401" in error_message:
-            return False, "API Anahtarı Geçersiz (Hata 401).", f"Streamlit Secrets'e eklediğiniz anahtar **{API_SERVICE}** servisi tarafından reddedildi. Lütfen anahtarın doğru olduğundan ve bu servise ait olduğundan emin olun."
+            return False, "API Anahtarı Geçersiz (Hata 401).", f"Streamlit Secrets'e eklediğiniz anahtar **{API_SERVICE}** servisi tarafından reddedildi."
         elif "404" in error_message and "does not exist" in error_message:
-            return False, f"Model Bulunamadı (Hata 404).", f"İstenen '{model}' modeli mevcut değil veya hesabınızın bu modele erişim izni yok. Lütfen x.ai hesabınızdan doğru model adını kontrol edip koddaki 'model' alanını güncelleyin."
+            return False, f"Model Bulunamadı (Hata 404).", f"İstenen '{model}' modeli mevcut değil veya hesabınızın bu modele erişim izni yok."
         else:
             return False, "Bilinmeyen bir API hatası oluştu.", f"Hata detayı: {error_message}"
 
@@ -74,16 +73,23 @@ else:
 
 # --- Buradan Sonrası Sadece API Testi Başarılı Olduğunda Çalışır ---
 st.markdown("---")
-st.header("Son 30 Günlük Endüstriyel Hasar Raporu")
+st.header("En Son Endüstriyel Hasarlar Raporu")
 
-@st.cache_data(ttl=43200)
+@st.cache_data(ttl=3600) # Verileri saatte bir yenile
 def get_industrial_events(key, base_url, model):
     client = OpenAI(api_key=key, base_url=base_url)
-    start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
-    end_date = datetime.now().strftime('%Y-%m-%d')
     
+    # !!! YENİ VE GELİŞTİRİLMİŞ PROMPT !!!
+    # Modelin X (Twitter) entegrasyonunu ve gerçek zamanlı arama yeteneğini kullanmasını sağlıyoruz.
+    # "Son 30 gün" kısıtlamasını kaldırıp "en son 10 olay" mantığına geçiyoruz.
     prompt = f"""
-    Sen, Türkiye'deki endüstriyel riskleri analiz eden uzman bir sigorta hasar eksperisin. Görevin, son 30 gün içinde ({start_date} - {end_date}) Türkiye'de meydana gelen önemli endüstriyel olayları (yangın, patlama, kimyasal sızıntı vb.) tespit etmektir. Sadece teyit edilmiş ve sigortacılık açısından anlamlı (büyük maddi hasar, üretim durması, can kaybı) olayları dikkate al. Bulgularını, bir JSON dizisi (array) olarak döndür. SADECE HAM JSON DİZİSİNİ ÇIKTI VER, başka hiçbir metin ekleme. JSON Nesne Yapısı: ["olay_tarihi", "olay_tipi", "tesis_adi_turu", "adres_detay", "sehir", "ilce", "latitude", "longitude", "hasar_etkisi", "dogruluk_orani", "kaynaklar", "komsu_tesisler_risk_analizi"]. Eğer olay bulamazsan, boş bir JSON dizisi döndür: [].
+    Sen, Türkiye'deki endüstriyel riskleri anlık olarak takip eden ve X (Twitter) entegrasyonunu aktif olarak kullanan bir hasar tespit uzmanısın.
+    Görevin, Türkiye'de meydana gelmiş **en son 10 önemli** endüstriyel olayı (yangın, patlama, kimyasal sızıntı vb.) bulmaktır. Tarih aralığı önemli değil, en güncelden geriye doğru git.
+    Bu tespiti yaparken, özellikle son dakika haber ajansları (AA, DHA), güvenilir gazetecilerin ve resmi kurumların (valilik, itfaiye) X (Twitter) hesaplarındaki paylaşımları ve teyitli web haberlerini öncelikli olarak kullan.
+    Sadece sigortacılık açısından anlamlı (büyük maddi hasar, üretim durması, can kaybı) olayları dikkate al.
+    Bulgularını, bir JSON dizisi (array) olarak döndür. SADECE HAM JSON DİZİSİNİ ÇIKTI VER, başka hiçbir metin ekleme.
+    JSON Nesne Yapısı: ["olay_tarihi", "olay_tipi", "tesis_adi_turu", "adres_detay", "sehir", "ilce", "latitude", "longitude", "hasar_etkisi", "dogruluk_orani", "kaynaklar", "komsu_tesisler_risk_analizi"].
+    Eğer olay bulamazsan, boş bir JSON dizisi döndür: [].
     """
     try:
         response = client.chat.completions.create(model=model, messages=[{"role": "user", "content": prompt}], max_tokens=8192, temperature=0.1)
@@ -95,19 +101,21 @@ def get_industrial_events(key, base_url, model):
                 df['olay_tarihi'] = pd.to_datetime(df['olay_tarihi'])
                 df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
                 df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
+                # En güncel olayların üstte olması için sıralama
+                df = df.sort_values(by='olay_tarihi', ascending=False).reset_index(drop=True)
             return df
         return pd.DataFrame()
     except Exception as e:
         st.error(f"Veri çekme sırasında hata oluştu: {e}")
         return pd.DataFrame()
 
-if st.button("Analizi Başlat (Son 30 Gün)", type="primary"):
-    with st.spinner("Yapay zeka ile risk analizi yapılıyor, veriler taranıyor... Bu işlem 1-2 dakika sürebilir."):
+if st.button("Son 10 Olayı Analiz Et", type="primary"):
+    with st.spinner("Yapay zeka ile X (Twitter) ve web kaynakları taranıyor... Bu işlem 1-2 dakika sürebilir."):
         events_df = get_industrial_events(api_key, SELECTED_CONFIG["base_url"], SELECTED_CONFIG["model"])
 
     if not events_df.empty:
         st.success(f"{len(events_df)} adet önemli olay tespit edildi.")
-        st.subheader("Tespit Edilen Olaylar Listesi")
+        st.subheader("Tespit Edilen Son Olaylar Listesi")
         st.dataframe(events_df)
         st.subheader("Olayların Harita Üzerinde Gösterimi")
         map_df = events_df.dropna(subset=['latitude', 'longitude'])
@@ -121,6 +129,6 @@ if st.button("Analizi Başlat (Son 30 Gün)", type="primary"):
         else:
             st.warning("Harita üzerinde gösterilecek geçerli konum verisi bulunamadı.")
     else:
-        st.info("Son 30 gün içinde belirtilen kriterlere uygun, raporlanacak büyük bir endüstriyel olay tespit edilemedi.")
+        st.info("Belirtilen kriterlere uygun, raporlanacak bir endüstriyel olay tespit edilemedi.")
 
-st.caption("Bu analiz, yapay zeka tarafından kamuya açık veriler işlenerek oluşturulmuştur ve bilgilendirme amaçlıdır.")
+st.caption("Bu analiz, yapay zeka tarafından kamuya açık veriler ve X (Twitter) paylaşımları işlenerek oluşturulmuştur.")
