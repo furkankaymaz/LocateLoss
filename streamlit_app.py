@@ -1,5 +1,5 @@
 # ==============================================================================
-#      NİHAİ KOD (v14.3): Kararlı ve Standartlara Uygun Sürüm
+#      NİHAİ KOD (v15.0): İnsan Onaylı Kürasyon ve Derin Analiz Modeli
 # ==============================================================================
 import streamlit as st
 import pandas as pd
@@ -10,7 +10,7 @@ import json
 import re
 import requests
 from datetime import datetime
-from sqlalchemy import text # GÜNCELLEME: Güvenli SQL sorguları için eklendi
+from sqlalchemy import text
 
 # ------------------------------------------------------------------------------
 # 1. TEMEL AYARLAR VE BAĞLANTILAR
@@ -18,51 +18,38 @@ from sqlalchemy import text # GÜNCELLEME: Güvenli SQL sorguları için eklendi
 st.set_page_config(layout="wide", page_title="Endüstriyel Hasar İstihbaratı")
 st.title("🛰️ Akıllı Endüstriyel Hasar İstihbarat Platformu")
 
-# --- API Bağlantıları ---
+# --- API ve Veritabanı Bağlantıları ---
 grok_api_key = st.secrets.get("GROK_API_KEY")
 google_api_key = st.secrets.get("GOOGLE_MAPS_API_KEY")
 client = OpenAI(api_key=grok_api_key, base_url="https://api.x.ai/v1") if grok_api_key else None
 
-# --- Veritabanı Bağlantısı ---
 @st.cache_resource
 def init_connection():
     return st.connection("reports_db", type="sql", url="sqlite:///reports_db.db")
 
 conn = init_connection()
 
-# GÜNCELLEME: Tüm 'execute' komutları artık text() ile sarmalanıyor.
 def create_tables_if_not_exist():
     with conn.session as s:
-        s.execute(text('''
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_group_key TEXT UNIQUE,
-                first_seen_date TEXT
-            );
-        '''))
-        s.execute(text('''
-            CREATE TABLE IF NOT EXISTS reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id INTEGER,
-                report_json TEXT,
-                created_date TEXT,
-                FOREIGN KEY (event_id) REFERENCES events (id)
-            );
-        '''))
+        s.execute(text('CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, event_group_key TEXT UNIQUE, first_seen_date TEXT);'))
+        s.execute(text('CREATE TABLE IF NOT EXISTS reports (id INTEGER PRIMARY KEY, event_id INTEGER, report_json TEXT, created_date TEXT, FOREIGN KEY (event_id) REFERENCES events (id));'))
         s.commit()
 
 create_tables_if_not_exist()
 
+# Session State'i başlat
+if 'draft_reports' not in st.session_state:
+    st.session_state.draft_reports = {}
+
 # ------------------------------------------------------------------------------
 # 2. YAPAY ZEKA DESTEKLİ FONKSİYONLAR
 # ------------------------------------------------------------------------------
-# Bu bölümde değişiklik yoktur, önceki versiyonlarla aynıdır.
 @st.cache_data(ttl=900)
 def discover_events(_client, period_days=7):
-    prompt = f"Sen bir haber tarama botusun. Son {period_days} gün içinde Türkiye'de 'fabrika, sanayi, depo, liman, santral, OSB' kelimeleri ve 'yangın, patlama, kaza, hasar, sızıntı' kelimelerini içeren önemli haber başlıklarını ve linklerini bul. Sadece bir JSON listesi olarak `[{{\"headline\": \"...\", \"url\": \"...\"}}]` formatında ver. Analiz yapma, sadece listele. En fazla 30 başlık yeterli."
+    prompt = f"Sen bir haber tarama botusun. Son {period_days} gün içinde Türkiye'de 'fabrika, sanayi, depo, liman, santral, OSB' ve 'yangın, patlama, kaza, hasar, sızıntı' kelimelerini içeren önemli haber başlıklarını ve linklerini bul. Sadece bir JSON listesi olarak `[{{\"headline\": \"...\", \"url\": \"...\"}}]` formatında ver. En fazla 30 başlık yeterli."
     try:
         response = _client.chat.completions.create(model="grok-4-fast-reasoning", messages=[{"role": "user", "content": prompt}], max_tokens=4096, temperature=0.2)
-        content = response.choices[0].message.content.strip()
+        content = response.choices[0].message.content
         match = re.search(r'\[.*\]', content, re.DOTALL)
         return json.loads(match.group(0)) if match else []
     except Exception as e:
@@ -71,23 +58,32 @@ def discover_events(_client, period_days=7):
 @st.cache_data(ttl=900)
 def group_similar_events(_client, headlines):
     headlines_str = "\n".join([f"- {h['headline']}" for h in headlines])
-    prompt = f"""Sen bir haber editörüsün. Sana verdiğim şu haber başlıkları listesini analiz et ve aynı olaya ait olanları grupla. Çıktıyı bir JSON objesi olarak ver. Her anahtar, olay için birleştirici bir başlık olsun, değeri ise o gruba ait orijinal başlıkların listesi olsun. BAŞLIKLAR:\n{headlines_str}"""
+    prompt = f"Sen bir haber editörüsün. Sana verdiğim şu haber başlıkları listesini analiz et ve aynı olaya ait olanları grupla. Çıktıyı bir JSON objesi olarak ver. Her anahtar, olay için birleştirici bir başlık olsun, değeri ise o gruba ait orijinal başlıkların listesi olsun.\nBAŞLIKLAR:\n{headlines_str}"
     try:
         response = _client.chat.completions.create(model="grok-4-fast-reasoning", messages=[{"role": "user", "content": prompt}], max_tokens=4096, temperature=0.0)
-        content = response.choices[0].message.content.strip()
+        content = response.choices[0].message.content
         match = re.search(r'\{.*\}', content, re.DOTALL)
         return json.loads(match.group(0)) if match else {}
     except Exception as e:
         st.error(f"Gruplama aşamasında hata: {e}"); return {}
 
+# GÜNCELLEME: Bu prompt, AI'ı aktif araştırmaya zorlar.
 @st.cache_data(ttl=86400)
 def analyze_event_details(_client, headlines_list, group_key):
-    prompt = f"""Sen bir sigorta hasar eksperi ve risk analistisin. Sana verdiğim '{group_key}' olayı ile ilgili şu haber başlıklarını ve linklerini analiz et: {json.dumps(headlines_list, ensure_ascii=False)}.
-    GÖREVİN: Bu bilgileri kullanarak, tek ve birleştirilmiş, detaylı bir JSON raporu oluştur. Hasar tahminini haber metninden kaynak göstererek yap, ASLA tahmin yürütme.
-    JSON ANAHTARLARI: olay_tarihi_saati, guncel_durum, tesis_adi_ticari_unvan, sehir_ilce, olay_tipi_ozet, hasar_tahmini (nesne: tutar_araligi_tl, kaynak, aciklama), can_kaybi_ve_yaralilar (nesne: durum, detaylar), kaynak_linkleri (dizi), gorsel_linkleri (dizi), latitude, longitude"""
+    prompt = f"""
+    Sen elit bir sigorta istihbarat analistisin.
+    ANA GÖREVİN: Aşağıdaki URL listesini kullanarak web'i aktif olarak tara ve haber metinlerini OKU.
+    URL LİSTESİ: {json.dumps(headlines_list, ensure_ascii=False)}
+
+    İKİNCİL GÖREVİN: Haberde adı geçen ana tesisin adını ve olay hakkındaki ilk bilgileri teyit etmek için X (Twitter) üzerinde bir arama yap.
+
+    NİHAİ HEDEF: Topladığın TÜM bilgileri (web metinleri ve X) birleştirerek, '{group_key}' olayı için tek ve kapsamlı bir JSON raporu oluştur. Raporun tüm alanlarını doldurmak için elinden geleni yap. Özellikle 'latitude', 'longitude' ve kaynaklı 'hasar_tahmini' alanları kritiktir. Eğer bir bilgiyi bulamazsan, o alanı boş bırakmak yerine "Tespit Edilemedi" yaz.
+    
+    JSON ANAHTARLARI: olay_tarihi_saati, guncel_durum, tesis_adi_ticari_unvan, sehir_ilce, olay_tipi_ozet, hasar_tahmini (nesne: tutar_araligi_tl, kaynak, aciklama), can_kaybi_ve_yaralilar (nesne: durum, detaylar), kaynak_linkleri (dizi), gorsel_linkleri (dizi), latitude, longitude
+    """
     try:
         response = _client.chat.completions.create(model="grok-4-fast-reasoning", messages=[{"role": "user", "content": prompt}], max_tokens=4096, temperature=0.1)
-        content = response.choices[0].message.content.strip()
+        content = response.choices[0].message.content
         match = re.search(r'\{.*\}', content, re.DOTALL)
         return json.loads(match.group(0)) if match else None
     except Exception as e:
@@ -105,14 +101,12 @@ def find_neighboring_facilities(api_key, lat, lon, radius=300):
         st.warning(f"Google Places API hatası: {e}"); return []
 
 # ------------------------------------------------------------------------------
-# 3. GÜVENLİ VERİTABANI İŞLEMLERİ
+# 3. VERİTABANI İŞLEMLERİ
 # ------------------------------------------------------------------------------
-# conn.query kullanan fonksiyonlar zaten güvenlidir, değişiklik gerekmez.
 def check_event_exists(event_group_key):
     df = conn.query("SELECT id FROM events WHERE event_group_key = :key;", params={"key": event_group_key})
     return not df.empty
 
-# GÜNCELLEME: Bu fonksiyon artık güvenli ve standartlara uygun.
 def save_report_to_db(event_group_key, report_json):
     with conn.session as s:
         s.execute(text("INSERT INTO events (event_group_key, first_seen_date) VALUES (:key, :date);"),
@@ -138,90 +132,120 @@ def get_all_reports_from_db():
 # ------------------------------------------------------------------------------
 # 4. ARAYÜZ VE ANA İŞLEM AKIŞI
 # ------------------------------------------------------------------------------
-# Bu bölümde değişiklik yoktur.
 st.sidebar.header("Otomatik Tarama")
 run_auto_search = st.sidebar.button("Son Olayları Bul ve Analiz Et", type="primary", use_container_width=True)
-st.sidebar.caption("Son 7 güne ait olayları tarar, tekilleştirir ve analiz eder.")
+st.sidebar.caption("Son 7 güne ait olayları tarar, tekilleştirir, analiz eder ve onayınıza sunar.")
+
 tab1, tab2 = st.tabs(["🆕 Yeni Analiz Sonuçları", "🗃️ Geçmiş Raporlar Veritabanı"])
 
 if run_auto_search:
     if not client:
         st.error("Lütfen Grok API anahtarını Streamlit Secrets'a ekleyin."); st.stop()
     
-    with tab1:
-        # ... (Tüm işlem akışı v14.2 ile aynı)
-        with st.spinner("Aşama 1/5: Potansiyel olaylar web'den taranıyor..."):
-            headlines = discover_events(client)
-        if not headlines: st.warning("Keşif aşamasında yeni bir olay başlığı bulunamadı."); st.stop()
-        st.info(f"{len(headlines)} potansiyel başlık bulundu. Şimdi gruplanıyor...")
+    st.session_state.draft_reports = {} # Her yeni aramada taslakları temizle
+    
+    with st.spinner("Aşama 1/3: Potansiyel olaylar web'den taranıyor..."):
+        headlines = discover_events(client)
+    if not headlines: st.warning("Keşif aşamasında yeni bir olay başlığı bulunamadı."); st.stop()
 
-        with st.spinner("Aşama 2/5: AI ile benzer haberler gruplanıyor..."):
-            event_groups = group_similar_events(client, headlines)
-        st.success(f"{len(event_groups)} adet benzersiz olay grubu tespit edildi.")
+    with st.spinner(f"Aşama 2/3: {len(headlines)} başlık AI ile gruplanıyor ve tekilleştiriliyor..."):
+        event_groups = group_similar_events(client, headlines)
+    
+    st.info(f"{len(event_groups)} adet benzersiz olay grubu tespit edildi. Veritabanı kontrol ediliyor ve yeni olanlar analiz ediliyor...")
+
+    new_events_to_process = {}
+    for group_key, group_headlines in event_groups.items():
+        if not check_event_exists(group_key):
+            new_events_to_process[group_key] = group_headlines
+
+    if not new_events_to_process:
+        st.success("Tüm tespit edilen olaylar daha önce işlenmiş. Yeni bir olay bulunamadı.")
+        st.balloons()
+    else:
+        st.success(f"Analiz edilecek {len(new_events_to_process)} yeni olay grubu bulundu.")
         
-        newly_processed_count = 0
-        for group_key, group_headlines in event_groups.items():
-            st.markdown("---"); st.subheader(f"İncelenen Olay Grubu: {group_key}")
-            
-            if check_event_exists(group_key):
-                st.warning("Bu olay daha önce analiz edilmiş ve veritabanına kaydedilmiş. Atlanıyor."); continue
-
-            newly_processed_count += 1
-            with st.spinner(f"Aşama 3/5: '{group_key}' için derin analiz yapılıyor..."):
+        analysis_placeholder = st.empty()
+        for group_key, group_headlines in new_events_to_process.items():
+            with analysis_placeholder.status(f"Aşama 3/3: '{group_key}' için derin analiz yapılıyor...", expanded=True):
                 original_articles = [h for h in headlines if h['headline'] in group_headlines]
                 details = analyze_event_details(client, original_articles, group_key)
-            if not details: st.error("Bu olay için detaylı rapor oluşturulamadı."); continue
+                if not details: 
+                    st.error(f"'{group_key}' için detaylı rapor oluşturulamadı."); continue
 
-            lat, lon = details.get('latitude'), details.get('longitude')
-            real_neighbors = find_neighboring_facilities(google_api_key, lat, lon) if lat and lon else []
-            details['real_neighbors'] = real_neighbors
+                lat, lon = details.get('latitude'), details.get('longitude')
+                real_neighbors = find_neighboring_facilities(google_api_key, lat, lon) if lat and lon else []
+                details['real_neighbors'] = real_neighbors
+                
+                # Raporu veritabanına değil, geçici "taslak" listesine ekle
+                st.session_state.draft_reports[group_key] = details
+                st.success(f"'{group_key}' için rapor taslağı oluşturuldu. Onayınızı bekliyor.")
+        analysis_placeholder.empty()
 
-            save_report_to_db(group_key, details)
-            st.success(f"✔️ Rapor başarıyla oluşturuldu ve veritabanına kaydedildi!")
+# --- YENİ ANALİZLERİ GÖSTERME VE ONAYLAMA BÖLÜMÜ ---
+with tab1:
+    st.header("Onay Bekleyen Yeni Rapor Taslakları")
+    if not st.session_state.draft_reports:
+        st.info("Henüz onay bekleyen yeni bir rapor bulunmamaktadır. Lütfen yeni bir tarama başlatın.")
+    else:
+        for group_key, details in list(st.session_state.draft_reports.items()):
+            st.subheader(f"Rapor: {details.get('tesis_adi_ticari_unvan', group_key)}")
             
+            # Rapor önizlemesi
             col1, col2 = st.columns(2)
             # ... (Rapor gösterme kodu)
             with col1:
                 st.info(f"**Özet:** {details.get('olay_tipi_ozet', 'N/A')}")
                 hasar = details.get('hasar_tahmini', {})
-                st.metric(label="Hasar Tahmini", value=hasar.get('tutar_araligi_tl', 'Belirtilmemiş'), delta=hasar.get('kaynak', ''), delta_color="off")
+                st.metric(label="Hasar Tahmini", value=hasar.get('tutar_araligi_tl', 'Tespit Edilemedi'), delta=hasar.get('kaynak', ''), delta_color="off")
             with col2:
                 st.info(f"**Güncel Durum:** {details.get('guncel_durum', 'N/A')}")
-                can_kaybi = details.get('can_kaybi_ve_yaralilar', {})
-                if can_kaybi and can_kaybi.get('durum', 'hayır').lower() == 'evet':
-                    st.error(f"**Can Kaybı/Yaralı:** {can_kaybi.get('detaylar', 'Detay Yok')}")
             
-            if lat and lon:
+            if st.button("✔️ Onayla ve Veritabanına Kaydet", key=f"onay_{group_key}", type="primary"):
                 try:
-                    m = folium.Map(location=[float(lat), float(lon)], zoom_start=16)
-                    folium.Marker([float(lat), float(lon)], popup=f"<b>{details.get('tesis_adi_ticari_unvan')}</b>", tooltip="Ana Tesis", icon=folium.Icon(color='red', icon='fire')).add_to(m)
-                    folium_static(m, height=400)
-                except (ValueError, TypeError): st.warning("Geçersiz koordinat formatı, harita çizilemiyor.")
-            
-            with st.expander("Detaylı Raporu, Komşu Tesisleri ve Kaynakları Görüntüle"):
-                st.markdown("##### Gerçek Komşu Tesisler (Google Maps Verisi)")
-                st.table(pd.DataFrame(real_neighbors)) if real_neighbors else st.write("Yakın çevrede harita servisinden tesis tespit edilemedi.")
-                st.markdown("##### Kaynak Linkler")
-                for link in details.get('kaynak_linkleri', []): st.markdown(f"- {link}")
-        
-        if newly_processed_count == 0 and len(event_groups) > 0:
-            st.info("Tüm tespit edilen olaylar daha önce işlenmiş. Yeni bir olay bulunamadı."); st.balloons()
+                    save_report_to_db(group_key, details)
+                    st.success(f"'{group_key}' başarıyla veritabanına kaydedildi!")
+                    # Onaylanan raporu taslaklardan kaldır
+                    del st.session_state.draft_reports[group_key]
+                    st.experimental_rerun()
+                except Exception as e:
+                    st.error(f"Rapor kaydedilirken bir hata oluştu: {e}")
 
+            with st.expander("Tüm Rapor Detayını, Komşuları ve Kaynakları Görüntüle"):
+                # Harita
+                lat, lon = details.get('latitude'), details.get('longitude')
+                if lat and lon:
+                    try:
+                        m = folium.Map(location=[float(lat), float(lon)], zoom_start=16)
+                        folium.Marker([float(lat), float(lon)], popup=f"<b>{details.get('tesis_adi_ticari_unvan')}</b>", tooltip="Ana Tesis", icon=folium.Icon(color='red', icon='fire')).add_to(m)
+                        folium_static(m, height=300)
+                    except (ValueError, TypeError): st.warning("Geçersiz koordinat formatı, harita çizilemiyor.")
+                
+                # Detaylar
+                st.markdown("##### Gerçek Komşu Tesisler (Google Maps Verisi)")
+                st.table(pd.DataFrame(details.get('real_neighbors', []))) if details.get('real_neighbors') else st.write("Komşu tesis bilgisi yok.")
+                st.markdown("##### Kaynak Linkler")
+                for link in details.get('kaynak_linkleri', []): st.markdown(f"- {link}") if isinstance(link, str) else st.write(link)
+            st.markdown("---")
+
+# --- GEÇMİŞ RAPORLAR SEKMESİ ---
 with tab2:
-    st.header("🗃️ Veritabanında Kayıtlı Geçmiş Raporlar")
+    st.header("🗃️ Veritabanında Kayıtlı Onaylanmış Raporlar")
+    if st.button("Raporları Yenile"):
+        st.cache_data.clear() # Cache'i temizle
     all_reports = get_all_reports_from_db()
     if not all_reports:
         st.info("Veritabanında henüz kaydedilmiş bir rapor bulunmamaktadır.")
     else:
-        st.success(f"Veritabanında toplam {len(all_reports)} adet rapor bulundu.")
+        st.success(f"Veritabanında toplam {len(all_reports)} adet onaylanmış rapor bulundu.")
         for report in all_reports:
             tarih = pd.to_datetime(report['created_date']).strftime('%d %b %Y, %H:%M')
             with st.expander(f"**{report.get('tesis_adi_ticari_unvan', 'İsimsiz Tesis')}** - {report.get('sehir_ilce', 'Konum Yok')} (Kayıt: {tarih})"):
                 col1, col2 = st.columns(2)
+                # ... (Rapor gösterme kodu)
                 with col1:
                     st.info(f"**Özet:** {report.get('olay_tipi_ozet', 'N/A')}")
                     hasar = report.get('hasar_tahmini', {})
-                    st.metric(label="Hasar Tahmini", value=hasar.get('tutar_araligi_tl', 'Belirtilmemiş'), delta=hasar.get('kaynak', ''), delta_color="off")
+                    st.metric(label="Hasar Tahmini", value=hasar.get('tutar_araligi_tl', 'Tespit Edilemedi'), delta=hasar.get('kaynak', ''), delta_color="off")
                 with col2:
                     st.info(f"**Güncel Durum:** {report.get('guncel_durum', 'N/A')}")
                 st.markdown("##### Gerçek Komşu Tesisler (Google Maps Verisi)")
