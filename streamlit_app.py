@@ -1,5 +1,5 @@
 # ==============================================================================
-#           NİHAİ KOD (v7): PROFESYONEL RİSK ANALİZ PLATFORMU
+#           NİHAİ KOD (v8): TEK OLAY ODAKLI HATA AYIKLAMA VE GELİŞTİRİLMİŞ HARİTA
 # ==============================================================================
 import streamlit as st
 import pandas as pd
@@ -9,6 +9,7 @@ from streamlit_folium import folium_static
 from openai import OpenAI
 import json
 import re
+import base64 # Resimleri pop-up'a gömmek için
 
 # ------------------------------------------------------------------------------
 # 1. TEMEL AYARLAR
@@ -50,19 +51,17 @@ else:
 # ------------------------------------------------------------------------------
 
 @st.cache_data(ttl=900)
-def find_latest_events(key, base_url, model, event_count=15):
+def find_latest_events(key, base_url, model, event_count=1): # DEBUG: event_count=1 olarak ayarlandı
     client = OpenAI(api_key=key, base_url=base_url)
     current_date = datetime.now().strftime('%Y-%m-%d')
     prompt = f"""
-    Bugünün tarihi {current_date}. Türkiye'de **son 3 ay içinde** yaşanmış endüstriyel hasar olaylarını (fabrika yangını, patlama, kimyasal sızıntı vb.) tara.
-    Bulduğun tüm olaylar arasından, bana **en güncel {event_count} tanesini** listele. Bu listeyi oluştururken özellikle **son 72 saatteki** olaylara mutlak öncelik ver.
-    Öncelikli kaynakların X (Twitter)'daki resmi hesaplar (valilik, itfaiye) ve ulusal haber ajansları (AA, DHA, İHA) olsun.
-    Çıktıyı, aşağıdaki anahtarları içeren bir JSON dizisi olarak ver. Sadece listele, analiz yapma.
-    - "headline": "Olayın kısa ve net başlığı"
-    - "url": "Habere ait tam ve tıklanabilir birincil kaynak linki"
+    Bugünün tarihi {current_date}. Türkiye'de son 3 ay içinde yaşanmış endüstriyel hasar olaylarını (fabrika yangını, patlama vb.) tara.
+    Bulduğun olaylar arasından bana **en güncel {event_count} tanesini** listele. Özellikle son 72 saatteki olaylara öncelik ver.
+    Öncelikli kaynakların X (Twitter)'daki resmi hesaplar (valilik, itfaiye) ve ulusal haber ajansları (AA, DHA) olsun.
+    Çıktıyı, {"headline": "...", "url": "..."} anahtarlarını içeren bir JSON dizisi olarak ver. Sadece listele.
     """
     try:
-        response = client.chat.completions.create(model=model, messages=[{"role": "user", "content": prompt}], max_tokens=2048, temperature=0.0)
+        response = client.chat.completions.create(model=model, messages=[{"role": "user", "content": prompt}], max_tokens=512, temperature=0.0)
         content = response.choices[0].message.content.strip()
         match = re.search(r'\[.*\]', content, re.DOTALL)
         return json.loads(match.group(0)) if match else []
@@ -73,130 +72,127 @@ def find_latest_events(key, base_url, model, event_count=15):
 def analyze_single_event(key, base_url, model, headline, url):
     client = OpenAI(api_key=key, base_url=base_url)
     prompt = f"""
-    Sen, X (Twitter) ve ulusal haber ajanslarını çapraz kontrol ederek analiz yapan lider bir sigorta hasar eksperisin. Sana verilen şu haberi profesyonel bir gözle analiz et:
-    - Başlık: "{headline}"
-    - Ana Kaynak Link: "{url}"
+    Sen bir sigorta hasar eksperisin. Sana verilen şu haberi analiz et: "{headline}" ({url}).
+    GÖREVİN: X (Twitter) ve diğer haber ajanslarını kullanarak bu tek olayı çapraz kontrol et ve aşağıdaki JSON formatında detaylı bir rapor oluştur.
+    ÖNCELİK: Haberde veya X paylaşımlarında geçen **firma adını** tam ve doğru olarak tespit et. Karmaşık teyitlere (ticaret sicil vb.) gerek yok, sadece kaynaklarda belirtilen ismi bul.
 
-    Bu habere ve çapraz kontrolle bulacağın ek bilgilere dayanarak, aşağıdaki JSON formatında detaylı bir hasar raporu oluştur:
-    - "olay_tarihi_saati": "YYYY-MM-DD HH:MM:SS" (Tahmini saat bilgisiyle)
+    JSON ÇIKTI FORMATI:
+    - "olay_tarihi_saati": "YYYY-MM-DD HH:MM:SS"
     - "guncel_durum": "Yangın kontrol altına alındı, soğutma çalışmaları devam ediyor" gibi en son durum bilgisi.
-    - "tesis_adi_ticari_unvan": "Haberdeki ismi, Ticaret Sicil veya LinkedIn gibi kaynaklarla teyit ederek bulduğun tam ve resmi ticari unvan."
+    - "tesis_adi_ticari_unvan": "Haberde geçen en doğru ve tam firma adı."
     - "sehir_ilce": "İl, İlçe"
     - "olay_tipi_ozet": "Kısa ve profesyonel olay tanımı."
     - "hasar_tahmini": {{"tutar_araligi_tl": "Örn: 15-25 Milyon TL", "kaynak": "Haber metninde belirtildi / Ekspere dayalı tahmin", "aciklama": "Kritik makinelerin ve stokların durumu hakkında detay."}}
     - "can_kaybi_ve_yaralilar": {{"durum": "Evet / Hayır / Bilinmiyor", "detaylar": "Varsa ölen veya yaralanan kişilerin isimleri ve sayıları."}}
-    - "sigorta_teminatlari_analizi": {{"potansiyel_teminatlar": ["Yangın", "Kar Kaybı (BI)", "Enkaz Kaldırma"], "notlar": "Poliçe detaylarına göre değişebilecek profesyonel notlar."}}
     - "cevre_tesis_analizi": [{{"tesis_adi": "Komşu Tesis A.Ş.", "risk_faktoru": "Yüksek/Orta/Düşük", "aciklama": "Sıçrama, duman gibi risklerin analizi."}}]
     - "kaynak_linkleri": ["{url}", "https://buldugun.diger.kaynak/linki"]
     - "gorsel_linkleri": ["https://haberdeki.resim.linki/image.jpg"]
     - "latitude": Ondalık formatta enlem.
     - "longitude": Ondalık formatta boylam.
+
+    SON KONTROL: Raporu oluşturduktan sonra, tüm alanların (özellikle firma adı ve hasar tahmini) haber kaynaklarıyla tutarlı olduğunu son bir kez kontrol et.
     """
     try:
-        response = client.chat.completions.create(model=model, messages=[{"role": "user", "content": prompt}], max_tokens=4096, temperature=0.2)
+        response = client.chat.completions.create(model=model, messages=[{"role": "user", "content": prompt}], max_tokens=4096, temperature=0.1)
         content = response.choices[0].message.content.strip()
-        # Modellerin bazen JSON'u ```json ... ``` bloğu içine koyma eğilimi vardır.
         match = re.search(r'\{.*\}', content, re.DOTALL)
         return json.loads(match.group(0)) if match else None
     except Exception:
         return None
-        
-# ------------------------------------------------------------------------------
-# 4. YARDIMCI FONKSİYONLAR VE GÖRSEL ARAYÜZ
-# ------------------------------------------------------------------------------
 
-def parse_damage_to_radius(damage_str):
-    if not isinstance(damage_str, str): return 100
-    numbers = [int(s) for s in re.findall(r'\d+', damage_str)]
-    if not numbers: return 100
-    avg_damage = sum(numbers) / len(numbers)
-    if "milyar" in damage_str.lower(): multiplier = 1000
-    elif "milyon" in damage_str.lower(): multiplier = 1
-    elif "bin" in damage_str.lower(): multiplier = 0.01
-    else: multiplier = 0.00001
-    radius = (avg_damage * multiplier) * 20 + 200 # Temel bir ölçekleme
-    return min(radius, 5000) # Maksimum yarıçap
+# ------------------------------------------------------------------------------
+# 4. GÖRSEL ARAYÜZ
+# ------------------------------------------------------------------------------
+st.header("📈 En Son Tespit Edilen Hasarlar (Test Modu: Son 1 Olay)")
 
-st.header("📈 En Son Tespit Edilen Hasarlar")
-if st.button("En Son 15 Olayı Bul ve Profesyonel Analiz Yap", type="primary", use_container_width=True):
-    with st.spinner("1. Aşama: En son olaylar ve haber linkleri taranıyor..."):
+if st.button("En Son Olayı Bul ve Analiz Et", type="primary", use_container_width=True):
+    with st.spinner("1. Aşama: En son olay taranıyor..."):
         latest_events = find_latest_events(api_key, SELECTED_CONFIG["base_url"], SELECTED_CONFIG["model"])
 
     if not latest_events:
         st.info("Belirtilen kriterlere uygun, raporlanacak bir endüstriyel olay tespit edilemedi.")
     else:
-        st.success(f"**{len(latest_events)} adet potansiyel olay bulundu.** Şimdi her biri için derinlemesine analiz başlatılıyor...")
+        st.success(f"**1 adet potansiyel olay bulundu.** Şimdi derinlemesine analiz ediliyor...")
         
-        all_event_details, progress_bar = [], st.progress(0, text="Analiz ilerlemesi...")
-        for i, event in enumerate(latest_events):
-            progress_text = f"2. Aşama: '{event.get('headline', 'Bilinmeyen Olay')}' haberi analiz ediliyor... ({i+1}/{len(latest_events)})"
-            progress_bar.progress((i + 1) / len(latest_events), text=progress_text)
-            event_details = analyze_single_event(api_key, SELECTED_CONFIG["base_url"], SELECTED_CONFIG["model"], event.get('headline'), event.get('url'))
-            if event_details: all_event_details.append(event_details)
-        progress_bar.empty()
+        event = latest_events[0]
+        event_details = analyze_single_event(api_key, SELECTED_CONFIG["base_url"], SELECTED_CONFIG["model"], event.get('headline'), event.get('url'))
         
-        if not all_event_details:
-            st.warning("Olaylar bulundu ancak detaylı analiz sırasında bir sorun oluştu veya analiz sonucu geçerli formatta değildi.")
+        if not event_details:
+            st.warning("Olay bulundu ancak detaylı analiz sırasında bir sorun oluştu veya analiz sonucu geçerli formatta değildi.")
         else:
-            events_df = pd.DataFrame(all_event_details)
+            events_df = pd.DataFrame([event_details]) # Tek olaylık bir DataFrame oluştur
             events_df['olay_tarihi_saati'] = pd.to_datetime(events_df['olay_tarihi_saati'], errors='coerce')
-            events_df = events_df.sort_values(by='olay_tarihi_saati', ascending=False).reset_index(drop=True)
+            st.subheader("Analiz Edilen Son Olay Raporu")
+            
+            row = events_df.iloc[0].fillna('') # Tek satırı al
+            with st.expander(f"**{row['olay_tarihi_saati'].strftime('%d %b %Y, %H:%M')} - {row['tesis_adi_ticari_unvan']} ({row['sehir_ilce']})**", expanded=True):
+                 # ... (Rapor detayları önceki kodla aynı kalabilir, UI zaten iyi)
+                st.subheader(row['olay_tipi_ozet'])
+                st.info(f"**Güncel Durum:** {row['guncel_durum']}")
+                
+                gorsel_linkleri = row.get('gorsel_linkleri')
+                if gorsel_linkleri and isinstance(gorsel_linkleri, list) and gorsel_linkleri[0]:
+                    st.image(gorsel_linkleri[0], caption="Olay Yerinden Görüntü", use_column_width=True)
 
-            st.subheader("Analiz Edilen Son Olaylar Raporu")
-            for index, row in events_df.iterrows():
-                row = row.fillna('') # Boş alanlarda hata almamak için
-                with st.expander(f"**{row['olay_tarihi_saati'].strftime('%d %b %Y, %H:%M')} - {row['tesis_adi_ticari_unvan']} ({row['sehir_ilce']})**"):
-                    st.subheader(row['olay_tipi_ozet'])
-                    st.info(f"**Güncel Durum:** {row['guncel_durum']}")
+                st.markdown("---")
+                col1, col2 = st.columns(2)
+                with col1:
+                    hasar_tahmini = row.get('hasar_tahmini', {})
+                    st.markdown(f"##### Hasar Tahmini: `{hasar_tahmini.get('tutar_araligi_tl', 'Belirtilmemiş')}`")
+                    st.caption(f"Kaynak: {hasar_tahmini.get('kaynak', 'Bilinmiyor')}")
+                    st.write(hasar_tahmini.get('aciklama', ''))
                     
-                    if row.get('gorsel_linkleri') and isinstance(row['gorsel_linkleri'], list) and row['gorsel_linkleri']:
-                        st.image(row['gorsel_linkleri'][0], caption="Olay Yerinden Görüntü", use_column_width=True)
+                    can_kaybi = row.get('can_kaybi_ve_yaralilar', {})
+                    if can_kaybi.get('durum', 'Bilinmiyor').lower() == 'evet':
+                        st.error(f"**Can Kaybı / Yaralı:** {can_kaybi.get('detaylar', 'Detay belirtilmemiş.')}")
 
-                    st.markdown("---")
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        hasar_tahmini = row.get('hasar_tahmini', {})
-                        st.markdown(f"##### Hasar Tahmini: `{hasar_tahmini.get('tutar_araligi_tl', 'Belirtilmemiş')}`")
-                        st.caption(f"Kaynak: {hasar_tahmini.get('kaynak', 'Bilinmiyor')}")
-                        st.write(hasar_tahmini.get('aciklama', ''))
-                        
-                        can_kaybi = row.get('can_kaybi_ve_yaralilar', {})
-                        if can_kaybi.get('durum', 'Bilinmiyor').lower() == 'evet':
-                            st.error(f"**Can Kaybı / Yaralı:** {can_kaybi.get('detaylar', 'Detay belirtilmemiş.')}")
+                with col2:
+                    sigorta = row.get('sigorta_teminatlari_analizi', {})
+                    st.markdown("##### Potansiyel Sigorta Teminatları"); st.json(sigorta)
+                
+                st.markdown("---"); st.markdown("##### Çevre Tesisler İçin Risk Analizi")
+                st.table(pd.DataFrame(row.get('cevre_tesis_analizi',[])))
+                
+                st.markdown("---"); st.markdown("##### Tıklanabilir Kaynak Linkleri")
+                links_md = "".join([f"- [{link.split('//')[-1].split('/')[0]}]({link})\n" for link in row.get('kaynak_linkleri', [])])
+                st.markdown(links_md)
 
-                    with col2:
-                        sigorta = row.get('sigorta_teminatlari_analizi', {})
-                        st.markdown("##### Potansiyel Sigorta Teminatları")
-                        st.json(sigorta)
-
-                    st.markdown("---")
-                    st.markdown("##### Çevre Tesisler İçin Risk Analizi")
-                    st.table(pd.DataFrame(row['cevre_tesis_analizi']))
-                    
-                    st.markdown("---")
-                    st.markdown("##### Tıklanabilir Kaynak Linkleri")
-                    links_md = "".join([f"- [{link.split('//')[-1].split('/')[0]}]({link})\n" for link in row.get('kaynak_linkleri', [])])
-                    st.markdown(links_md)
-
-            st.header("🗺️ Olayların Konumsal ve Büyüklük Dağılımı")
+            # --- YENİ VE GELİŞTİRİLMİŞ HARİTA ---
+            st.header("🗺️ Olay Yeri İncelemesi")
             map_df = events_df.dropna(subset=['latitude', 'longitude'])
             if not map_df.empty:
-                map_center = [map_df['latitude'].mean(), map_df['longitude'].mean()]
-                m = folium.Map(location=map_center, zoom_start=6, tiles="CartoDB positron")
-                for _, row in map_df.iterrows():
-                    hasar = row.get('hasar_tahmini', {})
-                    radius = parse_damage_to_radius(hasar.get('tutar_araligi_tl', ''))
-                    popup_html = f"""
-                    <h6>{row['tesis_adi_ticari_unvan']}</h6>
-                    <b>Durum:</b> {row['guncel_durum']}<br>
-                    <b>Hasar Tahmini:</b> {hasar.get('tutar_araligi_tl', 'N/A')}
-                    """
-                    folium.Circle(
-                        location=[row['latitude'], row['longitude']],
-                        radius=radius,
-                        color='crimson',
-                        fill=True,
-                        fill_color='crimson',
-                        popup=folium.Popup(popup_html, max_width=300)
-                    ).add_to(m)
-                folium_static(m, width=None, height=600)
+                row = map_df.iloc[0]
+                map_center = [row['latitude'], row['longitude']]
+                m = folium.Map(location=map_center, zoom_start=15, tiles="CartoDB positron")
+
+                # Zengin HTML Pop-up içeriği oluşturma
+                gorsel_html = ""
+                if gorsel_linkleri and isinstance(gorsel_linkleri, list) and gorsel_linkleri[0]:
+                    gorsel_html = f'<img src="{gorsel_linkleri[0]}" width="280"><br>'
+
+                komsu_tesisler_html = "<h6>Komşu Tesis Riskleri:</h6><ul>"
+                for tesis in row.get('cevre_tesis_analizi', []):
+                    komsu_tesisler_html += f"<li><b>{tesis.get('tesis_adi')}</b>: {tesis.get('risk_faktoru')}</li>"
+                komsu_tesisler_html += "</ul>"
+
+                popup_html = f"""
+                <div style="font-family: Arial; max-width: 300px;">
+                    {gorsel_html}
+                    <h4>{row['tesis_adi_ticari_unvan']}</h4>
+                    <p><b>Durum:</b> {row['guncel_durum']}</p>
+                    <p><b>Hasar Tahmini:</b> {row.get('hasar_tahmini', {}).get('tutar_araligi_tl', 'N/A')}</p>
+                    <hr>
+                    {komsu_tesisler_html}
+                </div>
+                """
+                iframe = folium.IFrame(popup_html, width=320, height=400)
+                popup = folium.Popup(iframe, max_width=320)
+
+                folium.Marker(
+                    location=[row['latitude'], row['longitude']],
+                    popup=popup,
+                    tooltip=row['tesis_adi_ticari_unvan'],
+                    icon=folium.Icon(color='red', icon='fire')
+                ).add_to(m)
+                
+                folium_static(m, width=None, height=500)
