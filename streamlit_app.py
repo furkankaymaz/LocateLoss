@@ -1,5 +1,5 @@
 # ==============================================================================
-#      NİHAİ KOD (v8.3): Olay Bulma Mantığı İyileştirildi
+#      NİHAİ KOD (v8.4): f-string Formatlama Hatası Düzeltildi
 # ==============================================================================
 import streamlit as st
 import pandas as pd
@@ -49,13 +49,12 @@ else:
 # 3. İKİ AŞAMALI VERİ ÇEKME FONKSİYONLARI
 # ------------------------------------------------------------------------------
 
-# REVİZE EDİLDİ: Fonksiyon daha güvenilir sonuçlar için güncellendi.
 @st.cache_data(ttl=900)
-def find_latest_events(key, base_url, model, event_count=5): # Arama esnekliği için 5 olay istiyoruz.
+def find_latest_events(key, base_url, model, event_count=5):
     client = OpenAI(api_key=key, base_url=base_url)
     current_date = datetime.now().strftime('%Y-%m-%d')
     
-    # REVİZE EDİLDİ: Prompt basitleştirildi ve daha net hale getirildi.
+    # DÜZELTME: f-string içindeki literal {} karakterleri {{}} olarak yazıldı.
     prompt = f"""
     Bugünün tarihi {current_date}. Görevin, Türkiye'de son 3 ay içinde meydana gelmiş önemli endüstriyel hasar olaylarını (fabrika yangını, kimyasal sızıntı, büyük patlama vb.) bulmaktır.
     
@@ -64,13 +63,13 @@ def find_latest_events(key, base_url, model, event_count=5): # Arama esnekliği 
     Öncelikli kaynakların X (Twitter) ve güvenilir ulusal haber ajansları (Anadolu Ajansı, Demirören Haber Ajansı vb.) olsun.
     
     Çıktıyı, her olay için "headline" (manşet) ve "url" (haber linki) anahtarlarını içeren bir JSON dizisi olarak döndür. Başka hiçbir açıklama veya metin ekleme. Sadece ham JSON dizisini ver.
-    Örnek: [{"headline": "...", "url": "..."}]
+    Örnek: [ {{"headline": "...", "url": "..."}} ]
     """
     try:
         response = client.chat.completions.create(
-            model=model, 
-            messages=[{"role": "user", "content": prompt}], 
-            max_tokens=1024, # Daha fazla olay başlığı için token artırıldı
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1024,
             temperature=0.0
         )
         content = response.choices[0].message.content.strip()
@@ -79,7 +78,7 @@ def find_latest_events(key, base_url, model, event_count=5): # Arama esnekliği 
             return json.loads(match.group(0))
         else:
             st.warning("API'den geçerli bir JSON dizisi alınamadı. Ham yanıt aşağıdadır:")
-            st.code(content) # Hata ayıklama için ham yanıtı göster
+            st.code(content)
             return []
     except Exception as e:
         st.error(f"Olay arama sırasında bir hata oluştu: {e}")
@@ -127,13 +126,12 @@ def analyze_single_event(key, base_url, model, headline, url):
         return None
 
 # ------------------------------------------------------------------------------
-# 4. GÖRSEL ARAYÜZ
+# 4. GÖRSEL ARAYÜZ (Bu bölümde değişiklik yapılmadı)
 # ------------------------------------------------------------------------------
 st.header("📈 En Son Tespit Edilen Hasarlar (Test Modu: Son 1 Olay)")
 
 if st.button("En Son Olayı Bul ve Analiz Et", type="primary", use_container_width=True):
     with st.spinner("1. Aşama: Son olaylar taranıyor..."):
-        # Not: Fonksiyon 5 olay arasa da biz sadece ilkini işleyeceğiz.
         latest_events = find_latest_events(api_key, SELECTED_CONFIG["base_url"], SELECTED_CONFIG["model"])
 
     if not latest_events:
@@ -141,8 +139,7 @@ if st.button("En Son Olayı Bul ve Analiz Et", type="primary", use_container_wid
     else:
         st.success(f"**{len(latest_events)} adet potansiyel olay bulundu.** Şimdi en güncel olanı derinlemesine analiz ediliyor...")
 
-        # Analiz için sadece en güncel (listedeki ilk) olayı alıyoruz.
-        event = latest_events[0] 
+        event = latest_events[0]
         event_details = analyze_single_event(api_key, SELECTED_CONFIG["base_url"], SELECTED_CONFIG["model"], event.get('headline'), event.get('url'))
 
         if not event_details:
@@ -151,12 +148,12 @@ if st.button("En Son Olayı Bul ve Analiz Et", type="primary", use_container_wid
             events_df = pd.DataFrame([event_details])
             events_df['olay_tarihi_saati'] = pd.to_datetime(events_df['olay_tarihi_saati'], errors='coerce')
             st.subheader("Analiz Edilen Son Olay Raporu")
-            
+
             row = events_df.iloc[0].fillna('')
             with st.expander(f"**{row['olay_tarihi_saati'].strftime('%d %b %Y, %H:%M')} - {row['tesis_adi_ticari_unvan']} ({row['sehir_ilce']})**", expanded=True):
                 st.subheader(row['olay_tipi_ozet'])
                 st.info(f"**Güncel Durum:** {row['guncel_durum']}")
-                
+
                 gorsel_linkleri = row.get('gorsel_linkleri')
                 if gorsel_linkleri and isinstance(gorsel_linkleri, list) and gorsel_linkleri[0]:
                     st.image(gorsel_linkleri[0], caption="Olay Yerinden Görüntü", use_column_width=True)
@@ -168,7 +165,7 @@ if st.button("En Son Olayı Bul ve Analiz Et", type="primary", use_container_wid
                     st.markdown(f"##### Hasar Tahmini: `{hasar_tahmini.get('tutar_araligi_tl', 'Belirtilmemiş')}`")
                     st.caption(f"Kaynak: {hasar_tahmini.get('kaynak', 'Bilinmiyor')}")
                     st.write(hasar_tahmini.get('aciklama', ''))
-                    
+
                     can_kaybi = row.get('can_kaybi_ve_yaralilar', {})
                     if can_kaybi.get('durum', 'Bilinmiyor').lower() == 'evet':
                         st.error(f"**Can Kaybı / Yaralı:** {can_kaybi.get('detaylar', 'Detay belirtilmemiş.')}")
@@ -180,7 +177,7 @@ if st.button("En Son Olayı Bul ve Analiz Et", type="primary", use_container_wid
                         st.table(pd.DataFrame(cevre_tesis_data))
                     else:
                         st.write("Çevre tesis riski belirtilmemiş.")
-                
+
                 st.markdown("---"); st.markdown("##### Tıklanabilir Kaynak Linkleri")
                 kaynak_linkleri = row.get('kaynak_linkleri', [])
                 if kaynak_linkleri:
@@ -188,14 +185,14 @@ if st.button("En Son Olayı Bul ve Analiz Et", type="primary", use_container_wid
                     st.markdown(links_md)
                 else:
                     st.write("Kaynak link bulunamadı.")
-            
+
             st.header("🗺️ Olay Yeri İncelemesi")
             map_df = events_df.dropna(subset=['latitude', 'longitude'])
             if not map_df.empty:
                 row = map_df.iloc[0]
                 map_center = [row['latitude'], row['longitude']]
                 m = folium.Map(location=map_center, zoom_start=15, tiles="CartoDB positron")
-                
+
                 popup_html = f"<h4>{row['tesis_adi_ticari_unvan']}</h4><b>Durum:</b> {row['guncel_durum']}"
                 iframe = folium.IFrame(popup_html, width=250, height=100)
                 popup = folium.Popup(iframe, max_width=250)
@@ -206,5 +203,5 @@ if st.button("En Son Olayı Bul ve Analiz Et", type="primary", use_container_wid
                     tooltip=row['tesis_adi_ticari_unvan'],
                     icon=folium.Icon(color='red', icon='fire')
                 ).add_to(m)
-                
+
                 folium_static(m, width=None, height=500)
