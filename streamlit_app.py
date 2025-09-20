@@ -1,5 +1,5 @@
 # ==============================================================================
-#      NİHAİ KOD (v18.0): Sıfırlanmış, Odaklanmış ve Stabil Analiz Motoru
+#      NİHAİ KOD (v18.1): Temiz Başlangıç - Sadece Analiz Motoru
 # ==============================================================================
 import streamlit as st
 import pandas as pd
