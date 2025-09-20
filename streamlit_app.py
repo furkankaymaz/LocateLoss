@@ -1,5 +1,5 @@
 # ==============================================================================
-#      NİHAİ KOD (v14.1): Kararlı, Güvenli ve Tam Fonksiyonlu Sürüm
+#      NİHAİ KOD (v14.2): Kararlı Veritabanı Bağlantısı
 # ==============================================================================
 import streamlit as st
 import pandas as pd
@@ -11,24 +11,21 @@ import re
 import requests
 from datetime import datetime
 
-# ------------------------------------------------------------------------------
-# 1. TEMEL AYARLAR VE BAĞLANTILAR
-# ------------------------------------------------------------------------------
-st.set_page_config(layout="wide", page_title="Endüstriyel Hasar İstihbaratı")
-st.title("🛰️ Akıllı Endüstriyel Hasar İstihbarat Platformu")
-
-# --- API Bağlantıları ---
-grok_api_key = st.secrets.get("GROK_API_KEY")
-google_api_key = st.secrets.get("GOOGLE_MAPS_API_KEY")
-client = OpenAI(api_key=grok_api_key, base_url="https://api.x.ai/v1") if grok_api_key else None
+# ... (Diğer tüm kodlar aynı kalacak) ...
 
 # --- Veritabanı Bağlantısı ---
+# DÜZELTME: Bağlantı URL'i, Streamlit Cloud ile uyumluluk için açıkça belirtildi.
 @st.cache_resource
 def init_connection():
-    # Bu fonksiyon, veritabanı bağlantısını cache'leyerek her seferinde yeniden kurulmasını önler.
-    return st.connection("reports_db", type="sql")
+    return st.connection("reports_db", type="sql", url="sqlite:///reports_db.db")
 
 conn = init_connection()
+
+# ... (Kodun geri kalanı v14.1 ile tamamen aynı) ...
+# Tablo oluşturma, AI Fonksiyonları, Veritabanı Fonksiyonları ve Arayüz kodunu 
+# bir önceki yanıttan (v14.1) kopyalayarak bu değişikliği uygulayabilirsiniz.
+# Size kolaylık olması için tam kodu aşağıya tekrar ekliyorum.
+# ===============================================================================
 
 # Tabloları oluştur (sadece ilk çalıştırmada ve eğer yoksa çalışır)
 def create_tables_if_not_exist():
@@ -51,11 +48,19 @@ def create_tables_if_not_exist():
         ''')
         s.commit()
 
-create_tables_if_not_exist()
+# ... (Diğer tüm fonksiyonlar ve arayüz kodu v14.1 ile aynı)
+# Kodun tamamını aşağıya ekliyorum
+# ...
+# ==============================================================================
 
-# ------------------------------------------------------------------------------
-# 2. YAPAY ZEKA DESTEKLİ FONKSİYONLAR (PİPELİNE ADIMLARI)
-# ------------------------------------------------------------------------------
+st.set_page_config(layout="wide", page_title="Endüstriyel Hasar İstihbaratı")
+st.title("🛰️ Akıllı Endüstriyel Hasar İstihbarat Platformu")
+
+grok_api_key = st.secrets.get("GROK_API_KEY")
+google_api_key = st.secrets.get("GOOGLE_MAPS_API_KEY")
+client = OpenAI(api_key=grok_api_key, base_url="https://api.x.ai/v1") if grok_api_key else None
+
+create_tables_if_not_exist()
 
 @st.cache_data(ttl=900)
 def discover_events(_client, period_days=7):
@@ -111,9 +116,6 @@ def find_neighboring_facilities(api_key, lat, lon, radius=300):
         st.warning(f"Google Places API hatası: {e}")
         return []
 
-# ------------------------------------------------------------------------------
-# 3. GÜVENLİ VERİTABANI İŞLEMLERİ
-# ------------------------------------------------------------------------------
 def check_event_exists(event_group_key):
     df = conn.query("SELECT id FROM events WHERE event_group_key = :key;", params={"key": event_group_key})
     return not df.empty
@@ -141,9 +143,6 @@ def get_all_reports_from_db():
             continue
     return reports
 
-# ------------------------------------------------------------------------------
-# 4. ARAYÜZ VE ANA İŞLEM AKIŞI
-# ------------------------------------------------------------------------------
 st.sidebar.header("Otomatik Tarama")
 run_auto_search = st.sidebar.button("Son Olayları Bul ve Analiz Et", type="primary", use_container_width=True)
 st.sidebar.caption("Son 7 güne ait olayları tarar, tekilleştirir ve analiz eder.")
@@ -233,6 +232,5 @@ with tab2:
                     st.metric(label="Hasar Tahmini", value=hasar.get('tutar_araligi_tl', 'Belirtilmemiş'), delta=hasar.get('kaynak', ''), delta_color="off")
                 with col2:
                     st.info(f"**Güncel Durum:** {report.get('guncel_durum', 'N/A')}")
-
                 st.markdown("##### Gerçek Komşu Tesisler (Google Maps Verisi)")
                 st.table(pd.DataFrame(report.get('real_neighbors', []))) if report.get('real_neighbors') else st.write("Komşu tesis bilgisi yok.")
