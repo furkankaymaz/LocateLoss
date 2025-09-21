@@ -4,3 +4,4 @@ feedparser
 openai
 folium
 streamlit-folium
+rapidfuzz
