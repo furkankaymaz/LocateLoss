@@ -9,5 +9,3 @@ trafilatura
 readability-lxml
 beautifulsoup4
 lxml
-rapidfuzz
-sqlalchemy
