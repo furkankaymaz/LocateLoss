@@ -1,11 +1,12 @@
 streamlit
 pandas
+requests
+feedparser
 folium
 streamlit-folium
 openai
-requests
-feedparser
-beautifulsoup4
-lxml
 trafilatura
 readability-lxml
+beautifulsoup4
+lxml
+rapidfuzz
