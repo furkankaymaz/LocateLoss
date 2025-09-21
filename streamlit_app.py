@@ -1,123 +1,156 @@
 # ==============================================================================
-#  "Sıfır Noktası" MVP (v40.0): En Basit ve Direkt Analiz
+#  Nihai MVP (v41.0): RSS Kaynağı + Akıllı Google Arama Simülasyonu
 # ==============================================================================
 import streamlit as st
 import pandas as pd
-import folium
-from streamlit_folium import folium_static
+import feedparser
 from openai import OpenAI
 import json
 import re
+from urllib.parse import quote
+import folium
+from streamlit_folium import folium_static
 
 # ------------------------------------------------------------------------------
 # 1. TEMEL AYARLAR
 # ------------------------------------------------------------------------------
-st.set_page_config(layout="wide", page_title="Direkt AI Hasar Tespiti")
-st.title("🛰️ Direkt AI Hasar Tespit Motoru")
-st.info("Bu motor, yapay zekanın kendi dahili bilgi birikimini ve arama yeteneklerini kullanarak en güncel olayları bulur.")
+st.set_page_config(layout="wide", page_title="Akıllı Hasar Simülasyonu")
+st.title("🛰️ Akıllı Hasar Simülasyon Motoru")
 
-# --- API Bağlantısı ---
 grok_api_key = st.secrets.get("GROK_API_KEY")
+google_api_key = st.secrets.get("GOOGLE_MAPS_API_KEY") # Harita için gerekli
 client = OpenAI(api_key=grok_api_key, base_url="https://api.x.ai/v1") if grok_api_key else None
 
 # ------------------------------------------------------------------------------
-# 2. ÇEKİRDEK FONKSİYON: TEK ADIMDA TESPİT VE RAPORLAMA
+# 2. ÇEKİRDEK FONKSİYONLAR
 # ------------------------------------------------------------------------------
 
-@st.cache_data(ttl=1800) # Sonuçları 30 dakika önbellekte tut
-def get_events_directly_from_ai(_client):
-    """
-    Tek bir AI çağrısı ile en son olayları bulur, analiz eder ve yapılandırılmış
-    bir formatta döndürür. Web scraping veya RSS yoktur.
-    """
+@st.cache_data(ttl=900) # Haberleri 15 dakikada bir yenile
+def get_latest_events_from_rss():
+    """Google News RSS'ten en son olay adaylarını başlık ve özetleriyle çeker."""
+    locations = '"fabrika" OR "sanayi" OR "OSB" OR "liman" OR "depo"'
+    events = '"yangın" OR "patlama" OR "kaza" OR "sızıntı"'
+    q = f'({locations}) AND ({events})'
+    rss_url = f"https://news.google.com/rss/search?q={quote(q)}+when:3d&hl=tr&gl=TR&ceid=TR:tr"
+    
+    try:
+        feed = feedparser.parse(rss_url)
+        if not feed.entries:
+            return []
+        
+        articles = []
+        for entry in feed.entries[:15]: # En son 15 haberi al
+            summary_text = re.sub('<[^<]+?>', '', entry.get('summary', ''))
+            articles.append({
+                "headline": entry.title.split(" - ")[0],
+                "summary": summary_text,
+                "url": entry.link
+            })
+        return articles
+    except Exception as e:
+        st.error(f"RSS akışı okunurken hata: {e}")
+        return []
+
+@st.cache_data(ttl=3600)
+def analyze_event_with_simulation(_client, headline, summary):
+    """Verilen başlık ve özeti kullanarak Google Arama simülasyonu ile tesisi bulur ve raporlar."""
     prompt = f"""
-    Sen, Türkiye'deki endüstriyel riskleri anlık olarak takip eden, en güncel bilgilere erişimi olan ve X (Twitter) dahil olmak üzere kamuya açık web kaynaklarını tarayabilen elit bir istihbarat analistisin.
+    Sen, internetin tamamını taramış ve hafızasına kaydetmiş elit bir istihbarat analistisin.
 
-    ANA GÖREVİN: Türkiye'de son 15 gün içinde meydana gelmiş, sigortacılık açısından en önemli **en fazla 5 adet** endüstriyel veya enerji tesisi hasar olayını (yangın, patlama, büyük kaza vb.) bul ve her biri için detaylı bir rapor oluştur.
+    GÖREV: Sana verilen haber başlığı ve özetindeki ipuçlarını kullanarak bir **Google Arama simülasyonu** yapacaksın. Bu simülasyonla, olayın yaşandığı tesisin **ticari unvanını** bulmayı ve olayı sigortacılık perspektifiyle raporlamayı hedefliyorsun.
 
-    KRİTİK TALİMATLAR:
-    1.  **TESİS ADINI BULMAYA ODAKLAN:** Her olay için, olayın yaşandığı tesisin ticari unvanını tespit etmeye çalış. Bu bilgiyi hangi kaynağa (örn: AA haberi, Valilik açıklaması) dayandırdığını "tesis_adi_kanit" alanında belirt.
-    2.  **KANITA DAYALI OL:** Bilgileri doğrulanabilir kaynaklara dayandır. Eğer bir bilgi (örn: hasar miktarı) spekülatif ise, bunu belirt. ASLA bilgi uydurma.
-    3.  **SADECE JSON ÇIKTISI VER:** Bulgularını, aşağıda belirtilen yapıya sahip bir JSON dizisi (array) olarak döndür. Başka hiçbir metin veya açıklama ekleme. Eğer uygun bir olay bulamazsan, boş bir JSON dizisi `[]` döndür.
+    SANA VERİLEN İPUÇLARI:
+    - BAŞLIK: "{headline}"
+    - ÖZET: "{summary}"
 
-    JSON NESNE YAPISI (Her bir olay için):
+    DÜŞÜNCE SÜRECİN (ADIM ADIM):
+    1.  **Arama Sorgusu Oluştur:** İpuçlarından en etkili Google arama sorgusunu oluştur (örn: "Gebze Kömürcüler OSB boya fabrikası yangın").
+    2.  **Arama Sonuçlarını Değerlendir:** Hafızandaki bilgilere dayanarak, bu arama sonucunda karşına çıkacak haber başlıklarını ve snippet'leri düşün. Hangi haber kaynaklarının (AA, DHA, yerel basın) hangi şirket ismini verdiğini analiz et.
+    3.  **Teyit Et:** Farklı kaynakların aynı ismi verip vermediğini kontrol ederek en olası ticari unvanı bul.
+    4.  **Raporla:** Tüm bu simülasyon sürecinden elde ettiğin bilgileri, aşağıdaki JSON formatına eksiksiz bir şekilde dök.
+
+    JSON ÇIKTISI (SADECE JSON VER, AÇIKLAMA EKLEME):
     {{
-      "tesis_adi": "Yüksek doğrulukla tespit edilmiş ticari unvan.",
-      "tesis_adi_kanit": "Bu ismin tespit edildiği kaynak veya yöntem.",
+      "tesis_adi": "Simülasyon sonucu bulunan en olası ticari unvan.",
+      "kanit": "Bu isme nasıl ulaştığının açıklaması. Örn: 'Google'da yapılan '...' aramasında, AA ve DHA kaynakları ABC Kimya A.Ş. ismini teyit etmektedir.'",
       "sehir_ilce": "Olayın yaşandığı yer.",
-      "olay_tarihi": "YYYY-AA-GG formatında olay tarihi.",
-      "olay_ozeti": "Hasarın fiziksel boyutu, nedeni ve etkilerini içeren kısa özet.",
-      "guncel_durum": "Üretim durdu mu, soğutma çalışmaları sürüyor mu gibi en son bilgiler.",
-      "kaynak_url": "Bulduğun en güvenilir haberin veya resmi açıklamanın linki.",
-      "latitude": "Olay yerinin enlemi (Sadece sayı).",
-      "longitude": "Olay yerinin boylamı (Sadece sayı)."
+      "olay_ozeti": "Olayın fiziksel boyutu, nedeni ve sonuçları.",
+      "guncel_durum": "Üretim durması, müdahale durumu vb. en son bilgiler.",
+      "tahmini_koordinat": {{"lat": "...", "lon": "..."}}
     }}
     """
     try:
         response = _client.chat.completions.create(
             model="grok-4-fast-reasoning",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=8192,
+            max_tokens=4096,
             temperature=0.1
         )
-        content = response.choices[0].message.content.strip()
-        match = re.search(r'\[.*\]', content, re.DOTALL)
+        content = response.choices[0].message.content
+        match = re.search(r'\{.*\}', content, re.DOTALL)
         if match:
-            df = pd.DataFrame(json.loads(match.group(0)))
-            # Veri tiplerini dönüştürme ve sıralama
-            if not df.empty:
-                df['olay_tarihi'] = pd.to_datetime(df['olay_tarihi'], errors='coerce')
-                df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
-                df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
-                df = df.sort_values(by='olay_tarihi', ascending=False).reset_index(drop=True)
-            return df
-        return pd.DataFrame() # Eşleşme yoksa boş DataFrame döndür
+            return json.loads(match.group(0))
+        st.error(f"AI, geçerli bir JSON formatı üretemedi. Ham yanıt: {content}")
+        return None
     except Exception as e:
         st.error(f"AI Analizi sırasında hata oluştu: {e}")
-        return pd.DataFrame()
+        return None
 
 # ------------------------------------------------------------------------------
 # 3. STREAMLIT ARAYÜZÜ
 # ------------------------------------------------------------------------------
+col1, col2 = st.columns([1, 2], gap="large")
 
-if st.sidebar.button("🤖 En Son Olayları Analiz Et", type="primary", use_container_width=True):
-    if not client:
-        st.error("Lütfen Grok API anahtarını Streamlit Secrets'a ekleyin."); st.stop()
-
-    with st.spinner("AI, dahili bilgi bankasını ve web kaynaklarını tarıyor... Bu işlem 1-2 dakika sürebilir."):
-        events_df = get_events_directly_from_ai(client)
-
-    if not events_df.empty:
-        st.success(f"AI, analiz edilecek {len(events_df)} adet önemli olay tespit etti.")
-        st.session_state.events_df = events_df
-    else:
-        st.warning("AI, belirtilen kriterlere uygun, raporlanacak bir endüstriyel olay tespit edemedi.")
-        st.session_state.events_df = pd.DataFrame()
-
-if 'events_df' in st.session_state and not st.session_state.events_df.empty:
-    events_df = st.session_state.events_df
+with col1:
+    st.header("📰 Son Olaylar")
+    with st.spinner("Güncel haberler taranıyor..."):
+        events = get_latest_events_from_rss()
     
-    st.header("Tespit Edilen Olaylar")
-    for index, row in events_df.iterrows():
-        with st.expander(f"**{row['olay_tarihi'].strftime('%d %b %Y')} - {row['tesis_adi']}** ({row['sehir_ilce']})", expanded=index==0):
-            st.markdown(f"**Özet:** {row['olay_ozeti']}")
-            st.info(f"**Güncel Durum:** {row['guncel_durum']}")
-            st.caption(f"**Tesis Adı Kanıtı:** {row['tesis_adi_kanit']}")
-            st.caption(f"**Kaynak:** [{row['kaynak_url']}]({row['kaynak_url']})")
-
-    st.header("Olayların Harita Üzerinde Gösterimi")
-    map_df = events_df.dropna(subset=['latitude', 'longitude'])
-    if not map_df.empty:
-        map_center = [map_df['latitude'].mean(), map_df['longitude'].mean()]
-        m = folium.Map(location=map_center, zoom_start=6, tiles="CartoDB positron")
-        for _, row in map_df.iterrows():
-            popup_html = f"<b>{row['tesis_adi']}</b><br>{row['sehir_ilce']}<br><i>{row['olay_ozeti'][:100]}...</i>"
-            folium.Marker(
-                [row['latitude'], row['longitude']], 
-                popup=folium.Popup(popup_html, max_width=300), 
-                tooltip=row['tesis_adi'],
-                icon=folium.Icon(color='red', icon='fire')
-            ).add_to(m)
-        folium_static(m, height=500)
+    if not events:
+        st.warning("Analiz edilecek yeni bir olay bulunamadı.")
     else:
-        st.warning("Harita üzerinde gösterilecek geçerli konum verisi bulunamadı.")
+        event_map = {f"{event['headline']}": event for event in events}
+        selected_headline = st.radio(
+            "Analiz için bir olay seçin:",
+            event_map.keys()
+        )
+        st.session_state.selected_event = event_map[selected_headline]
+
+with col2:
+    st.header("📝 Analiz Paneli")
+    if 'selected_event' in st.session_state:
+        event = st.session_state.selected_event
+        st.subheader(event['headline'])
+        st.caption(f"Kaynak: [{event['url']}]({event['url']})")
+        st.markdown(f"**Haber Özeti:** *{event['summary']}*")
+        
+        if st.button("🤖 Bu Olayı Analiz Et", type="primary", use_container_width=True):
+            if not client:
+                st.error("Lütfen Grok API anahtarını Streamlit Secrets'a ekleyin.")
+            else:
+                with st.spinner("AI, Google Arama simülasyonu ile istihbarat topluyor..."):
+                    report = analyze_event_with_simulation(client, event['headline'], event['summary'])
+                    st.session_state.report = report
+    
+    if 'report' in st.session_state and st.session_state.report:
+        report = st.session_state.report
+        st.markdown("---")
+        st.subheader(f"Rapor: {report.get('tesis_adi', 'Teyit Edilemedi')}")
+        st.info(f"**Kanıt Zinciri:** {report.get('kanit', 'N/A')}")
+        
+        st.success(f"**Güncel Durum:** {report.get('guncel_durum', 'N/A')}")
+        st.warning(f"**Olay Özeti:** {report.get('olay_ozeti', 'N/A')}")
+        
+        # Harita Kısmı
+        coords = report.get('tahmini_koordinat', {})
+        lat, lon = coords.get('lat'), coords.get('lon')
+        if lat and lon and google_api_key:
+            try:
+                m = folium.Map(location=[float(lat), float(lon)], zoom_start=14, tiles="CartoDB positron")
+                folium.Marker([float(lat), float(lon)], 
+                              popup=f"<b>{report.get('tesis_adi')}</b>", 
+                              icon=folium.Icon(color='red', icon='fire')).add_to(m)
+                st.subheader("Olay Yeri Haritası")
+                folium_static(m, height=300)
+            except (ValueError, TypeError):
+                st.warning("Rapor koordinatları geçersiz, harita çizilemiyor.")
