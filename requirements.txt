@@ -5,3 +5,4 @@ streamlit-folium
 openai
 requests
 feedparser
+newspaper3k
