@@ -1,315 +1,229 @@
-# -*- coding: utf-8 -*-
-import os
-import re
-import json
-import time
-import math
-import requests
-import feedparser
-import pandas as pd
-from urllib.parse import urlparse
-from datetime import datetime, timedelta, timezone
-from dateutil import parser as dateparser
-from unidecode import unidecode
 import streamlit as st
+import pandas as pd
+from datetime import datetime, timedelta
+import folium
+from streamlit_folium import folium_static
 from openai import OpenAI
+import json
+import re
 
-# --- içerik çıkarımı
-import trafilatura
-from bs4 import BeautifulSoup
+# ------------------------------------------------------------------------------
+# 1. TEMEL AYARLAR VE API ANAHTARI KONTROLÜ
+# ------------------------------------------------------------------------------
 
-# =========================
-# APP CONFIG
-# =========================
-st.set_page_config(page_title="Tesis Adı Çıkarımı – Grok (Yerel + Metin)", layout="wide")
-st.title("🏭 Tesis Adı Çıkarımı – Grok (Yerel haber gövdesinden)")
-
-GROK_API_KEY = os.getenv("GROK_API_KEY")
-if not GROK_API_KEY:
-    st.error("GROK_API_KEY ortam değişkeni tanımlı değil.")
-    st.stop()
-
-client = OpenAI(api_key=GROK_API_KEY, base_url="https://api.x.ai/v1")
-
-DEFAULT_MODEL = "grok-3"  # erişiminize göre grok-4 veya grok-4-fast-reasoning
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; FacilityExtractBot/1.0; +https://example.com)"
-}
-
-LOCAL_HINTS = [
-    ".bel.tr",".gov.tr",".edu.tr",".k12.tr",".osb",".osb.org",".org.tr",
-    "haber","sondakika","yerel","manset","gazete","kent","kenthaber","medya"
-]
-
-# =========================
-# YARDIMCI FONKSİYONLAR
-# =========================
-def norm(s: str) -> str:
-    if not s: return ""
-    s = unidecode(s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def google_news_rss_query(keywords: str, days: int = 7) -> str:
-    q = requests.utils.quote(f'({keywords}) when:{days}d')
-    return f"https://news.google.com/rss/search?q={q}&hl=tr&gl=TR&ceid=TR:tr"
-
-def fetch_rss(keyword_list, days_back=7, max_per_kw=20):
-    items = []
-    for kw in keyword_list:
-        url = google_news_rss_query(kw, days_back)
-        feed = feedparser.parse(url)
-        for e in feed.entries[:max_per_kw]:
-            link = e.get("link","")
-            title = e.get("title","")
-            summary = e.get("summary","")
-            published = e.get("published","") or e.get("updated","")
-            try:
-                dt = dateparser.parse(published)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-            except Exception:
-                dt = None
-            items.append({
-                "kw": kw,
-                "title": title,
-                "summary": summary,
-                "link": link,
-                "published": dt
-            })
-        time.sleep(0.3)  # nazik davran
-    return items
-
-def domain_score(u: str) -> int:
-    try:
-        d = urlparse(u).netloc.lower()
-    except Exception:
-        return 0
-    score = 0
-    for hint in LOCAL_HINTS:
-        if hint in d:
-            score += 2
-    if any(x in d for x in ["ntv","cnnturk","hurriyet","sozcu","sabah","aa.com.tr","dha.com.tr"]):
-        score -= 1
-    return score
-
-def rank_and_pick(items, start_dt, end_dt, limit=20, only_local=True):
-    items = [it for it in items if isinstance(it["published"], datetime) and start_dt <= it["published"] <= end_dt]
-    for it in items:
-        it["score"] = domain_score(it["link"])
-    if only_local:
-        items = [it for it in items if it["score"] >= 1]
-    items = sorted(items, key=lambda x: (x["score"], x["published"]), reverse=True)
-    return items[:limit]
-
-def resolve_and_fetch(url: str, timeout=12) -> tuple[str, str]:
-    """
-    Google News yönlendirme linklerini kanonik habere çözüp HTML içeriğini getir.
-    returns: (final_url, html)
-    """
-    try:
-        r = requests.get(url, headers=HEADERS, allow_redirects=True, timeout=timeout)
-        final_url = r.url
-        html = r.text
-        # Bazı siteler JS ile yönlendirir; <meta http-equiv="refresh"> yakala
-        if "<meta http-equiv" in html.lower() and "url=" in html.lower():
-            soup = BeautifulSoup(html, "html.parser")
-            meta = soup.find("meta", attrs={"http-equiv": re.compile("refresh", re.I)})
-            if meta and "content" in meta.attrs:
-                m = re.search(r'url=(.+)', meta["content"], re.I)
-                if m:
-                    next_url = m.group(1).strip().strip("'\"")
-                    r2 = requests.get(next_url, headers=HEADERS, allow_redirects=True, timeout=timeout)
-                    final_url = r2.url
-                    html = r2.text
-        return final_url, html
-    except Exception:
-        return url, ""
-
-def extract_main_text(html: str) -> str:
-    """
-    Öncelik trafilatura; başarısızsa basit BeautifulSoup <p> fallback.
-    """
-    if not html:
-        return ""
-    try:
-        txt = trafilatura.extract(html, include_tables=False, include_comments=False, include_images=False)
-        if txt and len(txt) > 200:
-            return txt
-    except Exception:
-        pass
-    # fallback
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-        ps = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
-        txt = "\n".join(ps)
-        return txt
-    except Exception:
-        return ""
-
-def truncate(s: str, n: int) -> str:
-    if not s: return s
-    return s if len(s) <= n else s[: n-3] + "..."
-
-def chunks(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
-
-# =========================
-# GROK TESİS ADI ÇIKARIMI
-# =========================
-SYSTEM_PROMPT = """
-Sigorta amaçlı bilgi çıkarımı yapıyorsun.
-Aşağıda her biri için title, url ve article_text (haber gövdesi) verilecek.
-Görevin: metne DAYANARAK, olay başına TESİS ADI'nı tespit etmek.
-Kurallar:
-- Metinde açık unvan/isim geçiyorsa 'tesis_ad_teyit' = TEYITLI ve adı metindeki haliyle yaz.
-- Metin yalnızca sektörü/mahalleyi ima ediyorsa 'TAHMIN'.
-- Tesis adı bulunmuyorsa 'TEYIT_EDILEMEDI'.
-- JSON dizi döndür; alanlar:
-  olay_tarihi (YYYY-MM-DD veya null), sehir, ilce, tesis_adi,
-  tesis_ad_teyit (TEYITLI|TAHMIN|TEYIT_EDILEMEDI),
-  kanit_linkleri ([url]), aciklama, guven_skoru (0..1).
-- Uydurma yapma; metinde yoksa TEYIT_EDILEMEDI de.
-- SADECE ham JSON dizi yaz.
-"""
-
-@st.cache_data(show_spinner=False, ttl=900)
-def grok_extract_from_articles(model: str, docs: list):
-    # docs: [{"url","title","text","published"}]
-    compact = []
-    for d in docs:
-        compact.append({
-            "url": d["url"],
-            "title": truncate(unidecode(d["title"] or ""), 220),
-            "published": d["published"].strftime("%Y-%m-%d %H:%M") if isinstance(d["published"], datetime) else "",
-            "article_text": truncate(unidecode(d["text"] or ""), 2000)  # token tasarrufu
-        })
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT.strip()},
-        {"role": "user", "content": json.dumps({"articles": compact}, ensure_ascii=False)}
-    ]
-    resp = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        max_tokens=2400,
-        temperature=0.0
-    )
-    content = (resp.choices[0].message.content or "").strip()
-    m = re.search(r"\[.*\]\s*$", content, re.DOTALL)
-    if not m:
-        return []
-    try:
-        data = json.loads(m.group(0))
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-# =========================
-# UI – Parametreler
-# =========================
-with st.sidebar:
-    st.header("Sorgu Ayarları")
-    today = datetime.now(timezone.utc).date()
-    end_date = st.date_input("Bitiş Tarihi", value=today)
-    days_back = st.slider("Geri Gün", 1, 30, 7)
-    start_dt = datetime.combine(end_date - timedelta(days=days_back), datetime.min.time()).replace(tzinfo=timezone.utc)
-    end_dt = datetime.combine(end_date, datetime.max.time()).replace(tzinfo=timezone.utc)
-
-    st.markdown("**Anahtar Kelimeler (satır satır)**")
-    default_kws = [
-        "fabrika yangın", "tesis yangın", "sanayi yangını", "OSB yangın",
-        "patlama fabrika", "kimyasal sızıntı", "rafineri yangın", "trafo patlaması"
-    ]
-    kw_text = st.text_area("Kelimeler", "\n".join(default_kws), height=150)
-
-    only_local = st.checkbox("Sadece yerel domainleri seç", value=True)
-    max_links = st.slider("Toplanacak haber sayısı", 5, 80, 24, step=1)
-    fetch_timeout = st.slider("HTML indirme zaman aşımı (sn)", 6, 20, 12)
-    text_minlen = st.slider("Gerekli minimum metin uzunluğu", 200, 1500, 400, step=50)
-
-    model_name = st.selectbox("Grok Modeli", [DEFAULT_MODEL, "grok-4", "grok-4-fast-reasoning"], index=0)
-    batch_size = st.slider("Grok batch boyutu", 3, 20, 8, step=1)
-
-run = st.button("Tesis Adlarını Çıkar")
-
+st.set_page_config(layout="wide", page_title="Endüstriyel Hasar Analiz Paneli")
+st.title("🚨 Endüstriyel Hasar Analiz Paneli")
 st.markdown("---")
 
-# =========================
-# ÇALIŞTIR
-# =========================
-if run:
-    keywords = [k.strip() for k in kw_text.splitlines() if k.strip()]
+API_SERVICE = "Grok_XAI" 
 
-    with st.spinner("RSS kaynakları çekiliyor..."):
-        raw = fetch_rss(keywords, days_back=days_back, max_per_kw=20)
-    st.success(f"RSS'ten {len(raw)} aday haber geldi.")
+API_CONFIGS = {
+    "Grok_XAI": {
+        "base_url": "https://api.x.ai/v1",
+        "model": "grok-4-fast-reasoning", 
+    }
+}
+SELECTED_CONFIG = API_CONFIGS[API_SERVICE]
+API_KEY_NAME = "GROK_API_KEY"
 
-    picked = rank_and_pick(raw, start_dt, end_dt, limit=max_links, only_local=only_local)
-    if not picked:
-        st.warning("Seçilen aralık/filtre ile uygun link bulunamadı. 'Sadece yerel' filtresini kapatıp deneyin.")
-        st.stop()
+api_key = st.secrets.get(API_KEY_NAME)
 
-    # HTML getir + metin çıkar
-    docs = []
-    ok, fail = 0, 0
-    for it in picked:
-        final_url, html = resolve_and_fetch(it["link"], timeout=fetch_timeout)
-        if not html:
-            fail += 1
-            continue
-        text = extract_main_text(html)
-        if not text or len(text) < text_minlen:
-            fail += 1
-            continue
-        docs.append({
-            "url": final_url,
-            "title": it["title"],
-            "published": it["published"],
-            "text": text
-        })
-        ok += 1
-        time.sleep(0.4)  # nazik
+# ------------------------------------------------------------------------------
+# 2. API ANAHTARINI DOĞRULAMA FONKSİYONU
+# ------------------------------------------------------------------------------
 
-    st.info(f"Metin çıkarımı: başarı={ok}, başarısız={fail}. Grok'a {len(docs)} makale gönderilecek.")
-    if not docs:
-        st.warning("Yeterli metin çıkarılamadı. Minimum metin uzunluğunu düşürüp tekrar deneyin.")
-        st.stop()
+@st.cache_data(ttl=3600)
+def validate_api_key(key, base_url, model):
+    if not key:
+        return False, f"**{API_KEY_NAME}** adında bir anahtar Streamlit Secrets içinde bulunamadı.", "Lütfen Streamlit Cloud'da uygulamanızın 'Settings > Secrets' bölümüne giderek anahtarınızı ekleyin."
+    try:
+        client = OpenAI(api_key=key, base_url=base_url)
+        # Daha hafif bir test sorgusu
+        client.chat.completions.create(
+            model=model, 
+            messages=[{"role": "user", "content": "Test"}], 
+            max_tokens=5
+        )
+        return True, f"API anahtarı doğrulandı ve **{API_SERVICE} ({model})** servisine başarıyla bağlandı!", ""
+    except Exception as e:
+        error_message = str(e)
+        if "401" in error_message:
+            return False, "API Anahtarı Geçersiz (Hata 401).", f"Streamlit Secrets'e eklediğiniz anahtar **{API_SERVICE}** servisi tarafından reddedildi."
+        elif "404" in error_message:
+            return False, f"Model Bulunamadı (Hata 404).", f"İstenen '{model}' modeli mevcut değil veya hesabınızın bu modele erişim izni yok."
+        else:
+            return False, f"API bağlantı hatası: {error_message}", f"Lütfen anahtarınızı ve internet bağlantınızı kontrol edin."
 
-    # Kaynak önizleme
-    prev = pd.DataFrame([{"published": d["published"], "domain": urlparse(d["url"]).netloc,
-                          "title": d["title"], "len(text)": len(d["text"])} for d in docs])
-    st.dataframe(prev, use_container_width=True)
+# ------------------------------------------------------------------------------
+# 3. GELİŞMİŞ ENDÜSTRİYEL OLAY SORGULAMA FONKSİYONU (GROK PROMPT ENTEGRE)
+# ------------------------------------------------------------------------------
 
-    # Grok batch
-    results = []
-    for chunk in chunks(docs, batch_size):
-        with st.spinner(f"Grok çıkarım yapıyor... ({len(chunk)} makale)"):
-            out = grok_extract_from_articles(model_name, chunk)
-            results.extend(out)
-        time.sleep(0.8)
+@st.cache_data(ttl=3600) # Verileri saatte bir yenile
+def get_industrial_events(key, base_url, model):
+    client = OpenAI(api_key=key, base_url=base_url)
+    
+    # GROK'UN ÖNERDİĞİ GELİŞMİŞ PROMPT + JSON ÇIKTI FORMATI
+    prompt = """
+    Sen bir sigorta uzmanısın. Görevin, Türkiye'de meydana gelmiş EN SON 10 ÖNEMLİ endüstriyel olayı (yangın, patlama, kimyasal sızıntı vb.) bulmak ve raporlamaktır.
+    
+    KRİTİK TALİMATLAR:
+    1. Tesis adlarını web haberleri, X (Twitter) aramaları gibi kaynaklardan YÜKSEK DOĞRULUKLA TEYİT ET. Teyit edilemezse 'Teyit Edilemedi' diye belirt.
+    2. Sadece sigortacılık açısından anlamlı (büyük maddi hasar, üretim durması, can kaybı) olayları seç.
+    3. Son dakika haberlerini ve sosyal medya paylaşımlarını önceliklendir.
+    4. Bulgularını, aşağıdaki yapıda BİR JSON DİZİSİ (array) olarak döndür. SADECE HAM JSON DİZİSİNİ ÇIKTI VER, başka hiçbir metin ekleme.
+    
+    JSON Nesne Yapısı: 
+    [
+      {
+        "olay_tarihi": "YYYY-MM-DD",
+        "olay_tipi": "yangın/patlama/sızıntı vb.",
+        "tesis_adi_turu": "Teyit edilmiş tesis adı veya 'Teyit Edilemedi'",
+        "adres_detay": "Adres bilgisi",
+        "sehir": "Şehir adı",
+        "ilce": "İlçe adı (biliniyorsa)",
+        "latitude": 40.1234,
+        "longitude": 29.1234,
+        "hasar_etkisi": "Hasarın sigortacılık açısından etkisi",
+        "dogruluk_orani": "Yüksek/Orta/Düşük",
+        "kaynaklar": "Haber linkleri veya kaynaklar",
+        "komsu_tesisler_risk_analizi": "Çevre risk analizi"
+      }
+    ]
+    Eğer olay bulamazsan, boş bir JSON dizisi döndür: [].
+    """
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=4000,  # JSON çıktı uzun olabileceği için arttırıldı
+            temperature=0.1
+        )
+        content = response.choices[0].message.content.strip()
+        
+        # JSON'u içerikten çekmek için regex
+        match = re.search(r'\[.*\]', content, re.DOTALL)
+        if match:
+            json_data = json.loads(match.group(0))
+            df = pd.DataFrame(json_data)
+            
+            if not df.empty:
+                # Veri tiplerini düzelt
+                df['olay_tarihi'] = pd.to_datetime(df['olay_tarihi'], errors='coerce')
+                df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
+                df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
+                
+                # Boş koordinatları filtrele ve en güncel olaylar üstte olacak şekilde sırala
+                df = df.dropna(subset=['olay_tarihi']).sort_values(by='olay_tarihi', ascending=False).reset_index(drop=True)
+            
+            return df
+        
+        return pd.DataFrame()
+        
+    except json.JSONDecodeError as e:
+        st.error(f"API'den dönen yanıt JSON formatında ayrıştırılamadı: {e}")
+        st.code(content)  # Hata ayıklama için ham içeriği göster
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"Veri çekme sırasında beklenmeyen bir hata oluştu: {e}")
+        return pd.DataFrame()
 
-    if not results:
-        st.warning("Grok, sağlanan metinlerden tesis adı çıkaramadı. Text/limit/batch parametrelerini ayarlayın.")
-        st.stop()
+# ------------------------------------------------------------------------------
+# 4. UYGULAMA AKIŞI: ÖNCE TEST ET, SONRA ÇALIŞTIR
+# ------------------------------------------------------------------------------
 
-    # Sonuçlar
-    df = pd.DataFrame(results)
-    for c in ["olay_tarihi","sehir","ilce","tesis_adi","tesis_ad_teyit","guven_skoru","aciklama","kanit_linkleri"]:
-        if c not in df.columns:
-            df[c] = None
+st.subheader("⚙️ API Bağlantı Durumu")
+is_valid, status_message, solution_message = validate_api_key(api_key, SELECTED_CONFIG["base_url"], SELECTED_CONFIG["model"])
 
-    st.subheader("🔎 Çıkarılan Tesis Adları")
-    st.dataframe(df[["olay_tarihi","sehir","ilce","tesis_adi","tesis_ad_teyit","guven_skoru","aciklama"]], use_container_width=True)
-
-    st.subheader("🔗 Kanıt Linkleri")
-    for i, row in df.iterrows():
-        links = row.get("kanit_linkleri") or []
-        if links:
-            st.markdown(f"**Olay {i+1} – {row.get('tesis_adi') or 'Tesis?'}**")
-            for L in links[:6]:
-                st.markdown(f"- {L}")
-
-    st.success("Tamam. Bu çıktı üzerine doğrulama/harita/PD-BI adımlarını ekleyebiliriz.")
+if is_valid:
+    st.success(f"✅ **BAŞARILI:** {status_message}")
 else:
-    st.info("Parametreleri seçip 'Tesis Adlarını Çıkar' butonuna basın. Bu adım yalnızca tesis adını tespit eder.")
+    st.error(f"❌ **HATA:** {status_message}")
+    st.warning(f"👉 **ÇÖZÜM ÖNERİSİ:** {solution_message}")
+    st.stop()
+
+# --- Buradan Sonrası Sadece API Testi Başarılı Olduğunda Çalışır ---
+st.markdown("---")
+st.header("En Son Endüstriyel Hasarlar Raporu")
+
+# Kullanıcı arayüzü için biraz daha bilgilendirici açıklama
+st.info("""
+**ℹ️ Bilgi:** Bu sistem, Grok AI'nin X (Twitter) entegrasyonu ve gerçek zamanlı web tarama yeteneklerini kullanarak 
+Türkiye'deki en son ve en önemli 10 endüstriyel hasarı tespit etmeye çalışır. 
+Tesis isimleri özellikle yüksek doğrulukla teyit edilmeye çalışılır.
+""")
+
+if st.button("🔍 Son 10 Kritik Olayı Araştır", type="primary", help="Grok API'sini kullanarak en son endüstriyel olayları tarar"):
+    with st.spinner("Yapay zeka ile X (Twitter) ve web kaynakları taranıyor... Bu işlem 1-2 dakika sürebilir."):
+        events_df = get_industrial_events(api_key, SELECTED_CONFIG["base_url"], SELECTED_CONFIG["model"])
+
+    if not events_df.empty:
+        st.success(f"✅ {len(events_df)} adet önemli olay tespit edildi ve analiz edildi.")
+        
+        # Verileri Göster
+        st.subheader("📋 Tespit Edilen Son Olaylar Listesi")
+        
+        # Daha okunabilir bir tablo için tarihi formatla
+        display_df = events_df.copy()
+        display_df['olay_tarihi'] = display_df['olay_tarihi'].dt.strftime('%d.%m.%Y')
+        
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            column_config={
+                "tesis_adi_turu": "Tesis Adı",
+                "olay_tipi": "Olay Tipi",
+                "sehir": "Şehir",
+                "hasar_etkisi": st.column_config.TextColumn("Hasar Etkisi", width="medium"),
+                "dogruluk_orani": "Doğruluk",
+                "kaynaklar": st.column_config.LinkColumn("Kaynaklar", display_text="Link")
+            }
+        )
+        
+        # Harita Gösterimi
+        st.subheader("🗺️ Olayların Harita Üzerinde Gösterimi")
+        map_df = events_df.dropna(subset=['latitude', 'longitude'])
+        
+        if not map_df.empty:
+            # Harita merkezini Türkiye'ye sabitle
+            map_center = [39.5, 35.5]  # Türkiye merkez koordinatları
+            m = folium.Map(location=map_center, zoom_start=6)
+            
+            for _, row in map_df.iterrows():
+                # Detaylı popup içeriği
+                popup_html = f"""
+                <div style="width: 250px;">
+                    <h4>{row['tesis_adi_turu']}</h4>
+                    <p><b>Tarih:</b> {row['olay_tarihi'].strftime('%d.%m.%Y')}<br>
+                    <b>Tip:</b> {row['olay_tipi']}<br>
+                    <b>Şehir:</b> {row['sehir']}<br>
+                    <b>Doğruluk:</b> {row['dogruluk_orani']}</p>
+                    <p><b>Etki:</b> {str(row['hasar_etkisi'])[:150]}...</p>
+                </div>
+                """
+                folium.Marker(
+                    [row['latitude'], row['longitude']],
+                    popup=folium.Popup(popup_html, max_width=300),
+                    tooltip=row['tesis_adi_turu'],
+                    icon=folium.Icon(color='red', icon='fire', prefix='fa')
+                ).add_to(m)
+            
+            folium_static(m, width=1100, height=600)
+        else:
+            st.warning("Harita üzerinde gösterilecek geçerli konum verisi bulunamadı.")
+            
+        # Ham Veriyi İnceleme Seçeneği (Geliştirici için)
+        with st.expander("📊 Ham Veriyi İncele (Geliştirici)"):
+            st.json(events_df.to_dict(orient='records'))
+            
+    else:
+        st.info("""
+        🤷‍♂️ Belirtilen kriterlere uygun, raporlanacak bir endüstriyel olay tespit edilemedi. 
+        Bu, gerçekten olay olmamasından veya API'nin sınırlamalarından kaynaklanıyor olabilir.
+        """)
+
+# Footer
+st.markdown("---")
+st.caption("""
+⚠️ Bu analiz, yapay zeka tarafından kamuya açık veriler ve X (Twitter) paylaşımları işlenerek oluşturulmuştur. 
+Doğruluk garantisi yoktur, profesyonel sigorta incelemesi yerine geçmez.
+""")
