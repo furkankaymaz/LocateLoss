@@ -14,11 +14,15 @@ from unidecode import unidecode
 import streamlit as st
 from openai import OpenAI
 
-# -------------------------------
+# --- içerik çıkarımı
+import trafilatura
+from bs4 import BeautifulSoup
+
+# =========================
 # APP CONFIG
-# -------------------------------
-st.set_page_config(page_title="Tesis Adı Çıkarımı (Grok)", layout="wide")
-st.title("🏭 Tesis Adı Çıkarımı – Grok Odaklı (Yerel + X doğrulama yönlendirmeli)")
+# =========================
+st.set_page_config(page_title="Tesis Adı Çıkarımı – Grok (Yerel + Metin)", layout="wide")
+st.title("🏭 Tesis Adı Çıkarımı – Grok (Yerel haber gövdesinden)")
 
 XAI_API_KEY = os.getenv("XAI_API_KEY")
 if not XAI_API_KEY:
@@ -27,36 +31,27 @@ if not XAI_API_KEY:
 
 client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
 
-DEFAULT_MODEL = "grok-3"  # erişiminize göre "grok-4" veya "grok-4-fast-reasoning" seçebilirsiniz
+DEFAULT_MODEL = "grok-3"  # erişiminize göre grok-4 veya grok-4-fast-reasoning
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; FacilityExtractBot/1.0; +https://example.com)"
+}
+
 LOCAL_HINTS = [
     ".bel.tr",".gov.tr",".edu.tr",".k12.tr",".osb",".osb.org",".org.tr",
     "haber","sondakika","yerel","manset","gazete","kent","kenthaber","medya"
 ]
 
-TR_CITIES = [
-    "Adana","Adıyaman","Afyonkarahisar","Ağrı","Aksaray","Amasya","Ankara","Antalya","Ardahan","Artvin",
-    "Aydın","Balıkesir","Bartın","Batman","Bayburt","Bilecik","Bingöl","Bitlis","Bolu","Burdur",
-    "Bursa","Çanakkale","Çankırı","Çorum","Denizli","Diyarbakır","Düzce","Edirne","Elazığ","Erzincan",
-    "Erzurum","Eskişehir","Gaziantep","Giresun","Gümüşhane","Hakkâri","Hatay","Iğdır","Isparta","İstanbul",
-    "İzmir","Kahramanmaraş","Karabük","Karaman","Kars","Kastamonu","Kayseri","Kırıkkale","Kırklareli","Kırşehir",
-    "Kilis","Kocaeli","Konya","Kütahya","Malatya","Manisa","Mardin","Mersin","Muğla","Muş",
-    "Nevşehir","Niğde","Ordu","Osmaniye","Rize","Sakarya","Samsun","Siirt","Sinop","Sivas",
-    "Şanlıurfa","Şırnak","Tekirdağ","Tokat","Trabzon","Tunceli","Uşak","Van","Yalova","Yozgat","Zonguldak"
-]
-CITY_RX = re.compile(r"\b(" + "|".join([re.escape(c) for c in TR_CITIES]) + r")\b", re.IGNORECASE)
-
+# =========================
+# YARDIMCI FONKSİYONLAR
+# =========================
 def norm(s: str) -> str:
     if not s: return ""
     s = unidecode(s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-# -------------------------------
-# RSS FETCH (deterministik)
-# -------------------------------
 def google_news_rss_query(keywords: str, days: int = 7) -> str:
     q = requests.utils.quote(f'({keywords}) when:{days}d')
-    # TR odaklı; ulusal kaynaklar gelebilir ama sonra filtreleyeceğiz
     return f"https://news.google.com/rss/search?q={q}&hl=tr&gl=TR&ceid=TR:tr"
 
 def fetch_rss(keyword_list, days_back=7, max_per_kw=20):
@@ -82,7 +77,7 @@ def fetch_rss(keyword_list, days_back=7, max_per_kw=20):
                 "link": link,
                 "published": dt
             })
-        time.sleep(0.4)  # nazik
+        time.sleep(0.3)  # nazik davran
     return items
 
 def domain_score(u: str) -> int:
@@ -90,82 +85,114 @@ def domain_score(u: str) -> int:
         d = urlparse(u).netloc.lower()
     except Exception:
         return 0
-    # Yerel ipucu içeren domainleri öne çek
     score = 0
     for hint in LOCAL_HINTS:
         if hint in d:
             score += 2
-    # büyük ulusal domainleri biraz kırp (ajanslar yerine yerel kaynak istiyoruz)
     if any(x in d for x in ["ntv","cnnturk","hurriyet","sozcu","sabah","aa.com.tr","dha.com.tr"]):
         score -= 1
     return score
 
-def rank_and_pick(items, start_dt, end_dt, limit=30, only_local=True):
-    # tarih aralığı
+def rank_and_pick(items, start_dt, end_dt, limit=20, only_local=True):
     items = [it for it in items if isinstance(it["published"], datetime) and start_dt <= it["published"] <= end_dt]
-    # skorla
     for it in items:
         it["score"] = domain_score(it["link"])
     if only_local:
         items = [it for it in items if it["score"] >= 1]
-    # taze + puanlı sırala
     items = sorted(items, key=lambda x: (x["score"], x["published"]), reverse=True)
     return items[:limit]
 
-# -------------------------------
-# GROK: TESIS ADI ÇIKARIMI
-# -------------------------------
-SCHEMA_EXAMPLE = [
-  {
-    "olay_tarihi": "2025-09-18",
-    "sehir": "Kayseri",
-    "ilce": "Melikgazi",
-    "tesis_adi": "Örnek Tekstil A.Ş. Fabrikası",
-    "tesis_ad_teyit": "TEYITLI | TAHMIN | TEYIT_EDILEMEDI",
-    "kanit_linkleri": ["https://yerelgazete.com.tr/...", "https://x.com/..."],
-    "aciklama": "Yerel haberde tesisin unvanı açıkça geçiyor. X hesabında itfaiye teyidi var.",
-    "guven_skoru": 0.92
-  }
-]
+def resolve_and_fetch(url: str, timeout=12) -> tuple[str, str]:
+    """
+    Google News yönlendirme linklerini kanonik habere çözüp HTML içeriğini getir.
+    returns: (final_url, html)
+    """
+    try:
+        r = requests.get(url, headers=HEADERS, allow_redirects=True, timeout=timeout)
+        final_url = r.url
+        html = r.text
+        # Bazı siteler JS ile yönlendirir; <meta http-equiv="refresh"> yakala
+        if "<meta http-equiv" in html.lower() and "url=" in html.lower():
+            soup = BeautifulSoup(html, "html.parser")
+            meta = soup.find("meta", attrs={"http-equiv": re.compile("refresh", re.I)})
+            if meta and "content" in meta.attrs:
+                m = re.search(r'url=(.+)', meta["content"], re.I)
+                if m:
+                    next_url = m.group(1).strip().strip("'\"")
+                    r2 = requests.get(next_url, headers=HEADERS, allow_redirects=True, timeout=timeout)
+                    final_url = r2.url
+                    html = r2.text
+        return final_url, html
+    except Exception:
+        return url, ""
 
-SYSTEM_PROMPT = """
-Sen bir sigorta uzmanısın ve canlı bilgiye erişebilen bir araştırmacı gibi davranacaksın.
-Aşağıda verilen HABER LİSTESİ, Türkiye'deki endüstriyel/sanayi olaylarına dair linklerden oluşur.
-Görevin: her linki **mümkünse yerel haber ve X paylaşımları ile teyit ederek** olay bazında TESİS ADI'nı çıkarmak.
-Kurallar:
-- Tesis adı net ve açık unvanla geçiyorsa "tesis_ad_teyit" = TEYITLI.
-- Sadece metinden tahmin ediliyorsa "TAHMIN".
-- Bulunamadıysa "TEYIT_EDILEMEDI".
-- Mümkünse en az 2 **kanıt_linki** ver (yerel haber + X postu/itfaiye/valilik).
-- Sadece Türkiye içindeki olaylar, son günlerdeki haberler.
-- Yanıt SADECE JSON dizi olsun; başka metin yok.
-- JSON alanları: olay_tarihi, sehir, ilce, tesis_adi, tesis_ad_teyit, kanit_linkleri, aciklama, guven_skoru.
-Dış doğrulama (web/X) yapabiliyorsan yap; yapamıyorsan link içeriğine ve başlığa dayan.
-"""
+def extract_main_text(html: str) -> str:
+    """
+    Öncelik trafilatura; başarısızsa basit BeautifulSoup <p> fallback.
+    """
+    if not html:
+        return ""
+    try:
+        txt = trafilatura.extract(html, include_tables=False, include_comments=False, include_images=False)
+        if txt and len(txt) > 200:
+            return txt
+    except Exception:
+        pass
+    # fallback
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        ps = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+        txt = "\n".join(ps)
+        return txt
+    except Exception:
+        return ""
+
+def truncate(s: str, n: int) -> str:
+    if not s: return s
+    return s if len(s) <= n else s[: n-3] + "..."
 
 def chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
+# =========================
+# GROK TESİS ADI ÇIKARIMI
+# =========================
+SYSTEM_PROMPT = """
+Sigorta amaçlı bilgi çıkarımı yapıyorsun.
+Aşağıda her biri için title, url ve article_text (haber gövdesi) verilecek.
+Görevin: metne DAYANARAK, olay başına TESİS ADI'nı tespit etmek.
+Kurallar:
+- Metinde açık unvan/isim geçiyorsa 'tesis_ad_teyit' = TEYITLI ve adı metindeki haliyle yaz.
+- Metin yalnızca sektörü/mahalleyi ima ediyorsa 'TAHMIN'.
+- Tesis adı bulunmuyorsa 'TEYIT_EDILEMEDI'.
+- JSON dizi döndür; alanlar:
+  olay_tarihi (YYYY-MM-DD veya null), sehir, ilce, tesis_adi,
+  tesis_ad_teyit (TEYITLI|TAHMIN|TEYIT_EDILEMEDI),
+  kanit_linkleri ([url]), aciklama, guven_skoru (0..1).
+- Uydurma yapma; metinde yoksa TEYIT_EDILEMEDI de.
+- SADECE ham JSON dizi yaz.
+"""
+
 @st.cache_data(show_spinner=False, ttl=900)
-def grok_extract_facilities(model, batch_items):
-    # batch_items: list of dict {title, summary, link, published}
-    payload = []
-    for it in batch_items:
-        payload.append({
-            "title": unidecode(re.sub(r"<.*?>","", it["title"] or ""))[:220],
-            "summary": unidecode(re.sub(r"<.*?>","", it["summary"] or ""))[:600],
-            "link": it["link"],
-            "published": it["published"].strftime("%Y-%m-%d %H:%M") if isinstance(it["published"], datetime) else ""
+def grok_extract_from_articles(model: str, docs: list):
+    # docs: [{"url","title","text","published"}]
+    compact = []
+    for d in docs:
+        compact.append({
+            "url": d["url"],
+            "title": truncate(unidecode(d["title"] or ""), 220),
+            "published": d["published"].strftime("%Y-%m-%d %H:%M") if isinstance(d["published"], datetime) else "",
+            "article_text": truncate(unidecode(d["text"] or ""), 2000)  # token tasarrufu
         })
     messages = [
-        {"role":"system","content": SYSTEM_PROMPT.strip()},
-        {"role":"user","content": json.dumps({"haber_listesi": payload}, ensure_ascii=False)}
+        {"role": "system", "content": SYSTEM_PROMPT.strip()},
+        {"role": "user", "content": json.dumps({"articles": compact}, ensure_ascii=False)}
     ]
     resp = client.chat.completions.create(
         model=model,
         messages=messages,
-        max_tokens=2200,
+        max_tokens=2400,
         temperature=0.0
     )
     content = (resp.choices[0].message.content or "").strip()
@@ -174,26 +201,13 @@ def grok_extract_facilities(model, batch_items):
         return []
     try:
         data = json.loads(m.group(0))
-        # şema güvenliği
-        out = []
-        for d in data:
-            out.append({
-                "olay_tarihi": d.get("olay_tarihi"),
-                "sehir": d.get("sehir"),
-                "ilce": d.get("ilce"),
-                "tesis_adi": d.get("tesis_adi"),
-                "tesis_ad_teyit": d.get("tesis_ad_teyit"),
-                "kanit_linkleri": d.get("kanit_linkleri", []),
-                "aciklama": d.get("aciklama"),
-                "guven_skoru": d.get("guven_skoru")
-            })
-        return out
+        return data if isinstance(data, list) else []
     except Exception:
         return []
 
-# -------------------------------
+# =========================
 # UI – Parametreler
-# -------------------------------
+# =========================
 with st.sidebar:
     st.header("Sorgu Ayarları")
     today = datetime.now(timezone.utc).date()
@@ -208,56 +222,84 @@ with st.sidebar:
         "patlama fabrika", "kimyasal sızıntı", "rafineri yangın", "trafo patlaması"
     ]
     kw_text = st.text_area("Kelimeler", "\n".join(default_kws), height=150)
-    only_local = st.checkbox("Sadece yerel domainleri Grok'a gönder", value=True)
-    max_links = st.slider("Grok'a gönderilecek link sayısı (toplam)", 5, 60, 25, step=5)
-    batch_size = st.slider("Batch boyutu (API tasarrufu)", 5, 25, 15, step=5)
-    model_name = st.selectbox("Grok Modeli", [DEFAULT_MODEL, "grok-4", "grok-4-fast-reasoning"], index=0)
 
-run = st.button("Tesis Adlarını Çıkar (Grok)")
+    only_local = st.checkbox("Sadece yerel domainleri seç", value=True)
+    max_links = st.slider("Toplanacak haber sayısı", 5, 80, 24, step=1)
+    fetch_timeout = st.slider("HTML indirme zaman aşımı (sn)", 6, 20, 12)
+    text_minlen = st.slider("Gerekli minimum metin uzunluğu", 200, 1500, 400, step=50)
+
+    model_name = st.selectbox("Grok Modeli", [DEFAULT_MODEL, "grok-4", "grok-4-fast-reasoning"], index=0)
+    batch_size = st.slider("Grok batch boyutu", 3, 20, 8, step=1)
+
+run = st.button("Tesis Adlarını Çıkar")
 
 st.markdown("---")
 
-# -------------------------------
-# Çalıştırma
-# -------------------------------
+# =========================
+# ÇALIŞTIR
+# =========================
 if run:
     keywords = [k.strip() for k in kw_text.splitlines() if k.strip()]
+
     with st.spinner("RSS kaynakları çekiliyor..."):
         raw = fetch_rss(keywords, days_back=days_back, max_per_kw=20)
     st.success(f"RSS'ten {len(raw)} aday haber geldi.")
 
     picked = rank_and_pick(raw, start_dt, end_dt, limit=max_links, only_local=only_local)
     if not picked:
-        st.warning("Seçilen aralık/filtre ile uygun yerel link bulunamadı. 'Sadece yerel' tikini kapatıp tekrar deneyin.")
+        st.warning("Seçilen aralık/filtre ile uygun link bulunamadı. 'Sadece yerel' filtresini kapatıp deneyin.")
         st.stop()
 
-    st.info(f"Grok'a gönderilecek link sayısı: {len(picked)} (batch={batch_size})")
-    df_src = pd.DataFrame([{
-        "published": it["published"],
-        "domain": urlparse(it["link"]).netloc if it["link"] else "",
-        "title": it["title"], "link": it["link"]
-    } for it in picked])
-    st.dataframe(df_src, use_container_width=True)
+    # HTML getir + metin çıkar
+    docs = []
+    ok, fail = 0, 0
+    for it in picked:
+        final_url, html = resolve_and_fetch(it["link"], timeout=fetch_timeout)
+        if not html:
+            fail += 1
+            continue
+        text = extract_main_text(html)
+        if not text or len(text) < text_minlen:
+            fail += 1
+            continue
+        docs.append({
+            "url": final_url,
+            "title": it["title"],
+            "published": it["published"],
+            "text": text
+        })
+        ok += 1
+        time.sleep(0.4)  # nazik
 
+    st.info(f"Metin çıkarımı: başarı={ok}, başarısız={fail}. Grok'a {len(docs)} makale gönderilecek.")
+    if not docs:
+        st.warning("Yeterli metin çıkarılamadı. Minimum metin uzunluğunu düşürüp tekrar deneyin.")
+        st.stop()
+
+    # Kaynak önizleme
+    prev = pd.DataFrame([{"published": d["published"], "domain": urlparse(d["url"]).netloc,
+                          "title": d["title"], "len(text)": len(d["text"])} for d in docs])
+    st.dataframe(prev, use_container_width=True)
+
+    # Grok batch
     results = []
-    for chunk in chunks(picked, batch_size):
-        with st.spinner(f"Grok çıkarım yapıyor... ({len(chunk)} link)"):
-            out = grok_extract_facilities(model_name, chunk)
+    for chunk in chunks(docs, batch_size):
+        with st.spinner(f"Grok çıkarım yapıyor... ({len(chunk)} makale)"):
+            out = grok_extract_from_articles(model_name, chunk)
             results.extend(out)
-        # nazik bekleme (kotaları zorlamamak için)
-        time.sleep(1.0)
+        time.sleep(0.8)
 
     if not results:
-        st.warning("Grok, verilen linklerden tesis adı çıkaramadı. Link sayısını artırın veya 'Sadece yerel' filtresini kapatıp yeniden deneyin.")
+        st.warning("Grok, sağlanan metinlerden tesis adı çıkaramadı. Text/limit/batch parametrelerini ayarlayın.")
         st.stop()
 
+    # Sonuçlar
     df = pd.DataFrame(results)
-    # Kolon düzeni
     for c in ["olay_tarihi","sehir","ilce","tesis_adi","tesis_ad_teyit","guven_skoru","aciklama","kanit_linkleri"]:
         if c not in df.columns:
             df[c] = None
 
-    st.subheader("🔎 Tesis Adı Çıkarımı – Sonuçlar")
+    st.subheader("🔎 Çıkarılan Tesis Adları")
     st.dataframe(df[["olay_tarihi","sehir","ilce","tesis_adi","tesis_ad_teyit","guven_skoru","aciklama"]], use_container_width=True)
 
     st.subheader("🔗 Kanıt Linkleri")
@@ -268,6 +310,6 @@ if run:
             for L in links[:6]:
                 st.markdown(f"- {L}")
 
-    st.success("Tamam. Sonraki adımda bu sonuçları PD/BI analizi ve haritalama için kullanabiliriz.")
+    st.success("Tamam. Bu çıktı üzerine doğrulama/harita/PD-BI adımlarını ekleyebiliriz.")
 else:
-    st.info("Parametreleri seçip 'Tesis Adlarını Çıkar (Grok)' butonuna basın. İlk adımda sadece tesis adı tespiti yapılır; API tüketimi batching ile sınırlıdır.")
+    st.info("Parametreleri seçip 'Tesis Adlarını Çıkar' butonuna basın. Bu adım yalnızca tesis adını tespit eder.")
