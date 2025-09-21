@@ -5,4 +5,7 @@ streamlit-folium
 openai
 requests
 feedparser
-newspaper3k
+beautifulsoup4
+lxml
+trafilatura
+readability-lxml
