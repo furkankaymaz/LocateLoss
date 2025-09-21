@@ -21,16 +21,16 @@ from streamlit_folium import folium_static
 st.set_page_config(page_title="Hasar İstihbarat (TR)", layout="wide")
 st.title("🚨 Endüstriyel Hasar İstihbarat – Türkiye (Grok + RSS)")
 
-# Ortam değişkeni: XAI_API_KEY zorunlu
-XAI_API_KEY = os.getenv("XAI_API_KEY")
+# Ortam değişkeni: GROK_API_KEY zorunlu
+GROK_API_KEY = os.getenv("GROK_API_KEY")
 DEFAULT_MODEL = "grok-3"  # erişiminize göre "grok-4" veya "grok-4-fast-reasoning" da seçebilirsiniz
 BASE_URL = "https://api.x.ai/v1"
 
-if not XAI_API_KEY:
-    st.error("XAI_API_KEY bulunamadı. Lütfen ortam değişkeni olarak ekleyin.")
+if not GROK_API_KEY:
+    st.error("GROK_API_KEY bulunamadı. Lütfen ortam değişkeni olarak ekleyin.")
     st.stop()
 
-client = OpenAI(api_key=XAI_API_KEY, base_url=BASE_URL)
+client = OpenAI(api_key=GROK_API_KEY, base_url=BASE_URL)
 
 # =========================
 # YARDIMCI FONKSİYONLAR
