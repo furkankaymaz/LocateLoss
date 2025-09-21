@@ -25,12 +25,12 @@ from bs4 import BeautifulSoup
 st.set_page_config(page_title="Tesis Adı Çıkarımı – Grok", layout="wide")
 st.title("🏭 Tesis Adı Çıkarımı – Grok (Yerel haber gövdesinden)")
 
-XAI_API_KEY = os.getenv("XAI_API_KEY")
-if not XAI_API_KEY:
-    st.error("XAI_API_KEY ortam değişkeni tanımlı değil. (x.ai anahtarınızı ekleyin.)")
+GROK_API_KEY = os.getenv("GROK_API_KEY")
+if not GROK_API_KEY:
+    st.error("GROK_API_KEY ortam değişkeni tanımlı değil. (x.ai anahtarınızı ekleyin.)")
     st.stop()
 
-client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
+client = OpenAI(api_key=GROK_API_KEY, base_url="https://api.x.ai/v1")
 DEFAULT_MODEL = "grok-4-fast-reasoning"  # erişiminize göre "grok-3" seçebilirsiniz
 
 HEADERS = {
