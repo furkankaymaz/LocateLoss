@@ -3,395 +3,271 @@ import os
 import re
 import json
 import time
+import math
 import requests
 import feedparser
 import pandas as pd
+from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 from dateutil import parser as dateparser
 from unidecode import unidecode
-from rapidfuzz import fuzz, process
 import streamlit as st
 from openai import OpenAI
-import folium
-from streamlit_folium import folium_static
 
-# =========================
-# AYARLAR
-# =========================
-st.set_page_config(page_title="Hasar İstihbarat (TR)", layout="wide")
-st.title("🚨 Endüstriyel Hasar İstihbarat – Türkiye (Grok + RSS)")
+# -------------------------------
+# APP CONFIG
+# -------------------------------
+st.set_page_config(page_title="Tesis Adı Çıkarımı (Grok)", layout="wide")
+st.title("🏭 Tesis Adı Çıkarımı – Grok Odaklı (Yerel + X doğrulama yönlendirmeli)")
 
-# Ortam değişkeni: GROK_API_KEY zorunlu
-GROK_API_KEY = os.getenv("GROK_API_KEY")
-DEFAULT_MODEL = "grok-3"  # erişiminize göre "grok-4" veya "grok-4-fast-reasoning" da seçebilirsiniz
-BASE_URL = "https://api.x.ai/v1"
-
-if not GROK_API_KEY:
-    st.error("GROK_API_KEY bulunamadı. Lütfen ortam değişkeni olarak ekleyin.")
+XAI_API_KEY = os.getenv("XAI_API_KEY")
+if not XAI_API_KEY:
+    st.error("XAI_API_KEY ortam değişkeni tanımlı değil.")
     st.stop()
 
-client = OpenAI(api_key=GROK_API_KEY, base_url=BASE_URL)
+client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
 
-# =========================
-# YARDIMCI FONKSİYONLAR
-# =========================
-def normalize_text(s: str) -> str:
-    if not s:
-        return ""
-    s = unidecode(s).strip()
-    s = re.sub(r"\s+", " ", s)
+DEFAULT_MODEL = "grok-3"  # erişiminize göre "grok-4" veya "grok-4-fast-reasoning" seçebilirsiniz
+LOCAL_HINTS = [
+    ".bel.tr",".gov.tr",".edu.tr",".k12.tr",".osb",".osb.org",".org.tr",
+    "haber","sondakika","yerel","manset","gazete","kent","kenthaber","medya"
+]
+
+TR_CITIES = [
+    "Adana","Adıyaman","Afyonkarahisar","Ağrı","Aksaray","Amasya","Ankara","Antalya","Ardahan","Artvin",
+    "Aydın","Balıkesir","Bartın","Batman","Bayburt","Bilecik","Bingöl","Bitlis","Bolu","Burdur",
+    "Bursa","Çanakkale","Çankırı","Çorum","Denizli","Diyarbakır","Düzce","Edirne","Elazığ","Erzincan",
+    "Erzurum","Eskişehir","Gaziantep","Giresun","Gümüşhane","Hakkâri","Hatay","Iğdır","Isparta","İstanbul",
+    "İzmir","Kahramanmaraş","Karabük","Karaman","Kars","Kastamonu","Kayseri","Kırıkkale","Kırklareli","Kırşehir",
+    "Kilis","Kocaeli","Konya","Kütahya","Malatya","Manisa","Mardin","Mersin","Muğla","Muş",
+    "Nevşehir","Niğde","Ordu","Osmaniye","Rize","Sakarya","Samsun","Siirt","Sinop","Sivas",
+    "Şanlıurfa","Şırnak","Tekirdağ","Tokat","Trabzon","Tunceli","Uşak","Van","Yalova","Yozgat","Zonguldak"
+]
+CITY_RX = re.compile(r"\b(" + "|".join([re.escape(c) for c in TR_CITIES]) + r")\b", re.IGNORECASE)
+
+def norm(s: str) -> str:
+    if not s: return ""
+    s = unidecode(s)
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def truncate(s: str, n: int = 280) -> str:
-    if not s:
-        return s
-    return s if len(s) <= n else s[: n - 3] + "..."
-
-def google_news_rss_query(keywords: str, days: int = 30) -> str:
-    """
-    Google News RSS: Türkçe sonuçlar, TR odaklı.
-    'when:Xd' ifadesiyle zaman kısıtı veriyoruz. site:tr ile yerel kaynakları öne çıkarıyoruz.
-    """
-    q = requests.utils.quote(f'({keywords}) site:tr when:{days}d')
+# -------------------------------
+# RSS FETCH (deterministik)
+# -------------------------------
+def google_news_rss_query(keywords: str, days: int = 7) -> str:
+    q = requests.utils.quote(f'({keywords}) when:{days}d')
+    # TR odaklı; ulusal kaynaklar gelebilir ama sonra filtreleyeceğiz
     return f"https://news.google.com/rss/search?q={q}&hl=tr&gl=TR&ceid=TR:tr"
 
-def fetch_rss_articles(keyword_list, days_back=30, max_per_keyword=20):
-    """
-    Birden fazla anahtar kelime için Google News RSS’den haber çeker.
-    Çıktı: list[dict] => {title, link, published, source, summary}
-    """
-    all_items = []
+def fetch_rss(keyword_list, days_back=7, max_per_kw=20):
+    items = []
     for kw in keyword_list:
         url = google_news_rss_query(kw, days_back)
         feed = feedparser.parse(url)
-        for entry in feed.entries[:max_per_keyword]:
-            title = entry.get("title", "")
-            link = entry.get("link", "")
-            summary = entry.get("summary", "")
-            published = entry.get("published", "") or entry.get("updated", "")
+        for e in feed.entries[:max_per_kw]:
+            link = e.get("link","")
+            title = e.get("title","")
+            summary = e.get("summary","")
+            published = e.get("published","") or e.get("updated","")
             try:
-                pub_dt = dateparser.parse(published)
+                dt = dateparser.parse(published)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
             except Exception:
-                pub_dt = None
-            source = entry.get("source", {}).get("title") or entry.get("author", "") or "RSS"
+                dt = None
+            items.append({
+                "kw": kw,
+                "title": title,
+                "summary": summary,
+                "link": link,
+                "published": dt
+            })
+        time.sleep(0.4)  # nazik
+    return items
 
-            all_items.append(
-                {
-                    "keyword": kw,
-                    "title": title,
-                    "link": link,
-                    "summary": summary,
-                    "published": pub_dt,
-                    "source": source,
-                }
-            )
-        # RSS limitleri nazik davranır; hızlı istekleri bölmek iyi olur
-        time.sleep(0.6)
-    return all_items
-
-def dedupe_articles(items):
-    """
-    Link ve başlığa göre kaba deduplikasyon.
-    """
-    seen_links = set()
-    out = []
-    for it in items:
-        link = it["link"]
-        title = normalize_text(it["title"]).lower()
-        if (link in seen_links) or any(
-            fuzz.token_sort_ratio(title, normalize_text(x["title"]).lower()) >= 93 for x in out
-        ):
-            continue
-        seen_links.add(link)
-        out.append(it)
-    return out
-
-def filter_by_date(items, start, end):
-    out = []
-    for it in items:
-        dt = it.get("published")
-        if not isinstance(dt, datetime):
-            continue
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        if start <= dt <= end:
-            out.append(it)
-    return out
-
-def load_reference_facilities(uploaded_file) -> pd.DataFrame | None:
-    """
-    Kullanıcı isterse CSV ile bir tesis referans listesi yükleyebilir.
-    Beklenen kolonlar (esnek): ['tesis_adi', 'sehir', 'ilce', 'adres']
-    """
-    if uploaded_file is None:
-        return None
+def domain_score(u: str) -> int:
     try:
-        df = pd.read_csv(uploaded_file)
-        # kolon isimlerini normalize et
-        df.columns = [c.strip().lower() for c in df.columns]
-        return df
-    except Exception as e:
-        st.warning(f"Referans dosyası okunamadı: {e}")
-        return None
+        d = urlparse(u).netloc.lower()
+    except Exception:
+        return 0
+    # Yerel ipucu içeren domainleri öne çek
+    score = 0
+    for hint in LOCAL_HINTS:
+        if hint in d:
+            score += 2
+    # büyük ulusal domainleri biraz kırp (ajanslar yerine yerel kaynak istiyoruz)
+    if any(x in d for x in ["ntv","cnnturk","hurriyet","sozcu","sabah","aa.com.tr","dha.com.tr"]):
+        score -= 1
+    return score
 
-def fuzzy_match_facility(name: str, ref_df: pd.DataFrame, threshold: int = 90):
-    """
-    Referans listesi varsa ad eşleştirme yapar; yoksa None döner.
-    """
-    if ref_df is None or "tesis_adi" not in ref_df.columns:
-        return None
-    choices = ref_df["tesis_adi"].astype(str).tolist()
-    best = process.extractOne(name, choices, scorer=fuzz.WRatio)
-    if best and best[1] >= threshold:
-        matched_name = best[0]
-        row = ref_df[ref_df["tesis_adi"] == matched_name].iloc[0].to_dict()
-        row["match_score"] = int(best[1])
-        return row
-    return None
+def rank_and_pick(items, start_dt, end_dt, limit=30, only_local=True):
+    # tarih aralığı
+    items = [it for it in items if isinstance(it["published"], datetime) and start_dt <= it["published"] <= end_dt]
+    # skorla
+    for it in items:
+        it["score"] = domain_score(it["link"])
+    if only_local:
+        items = [it for it in items if it["score"] >= 1]
+    # taze + puanlı sırala
+    items = sorted(items, key=lambda x: (x["score"], x["published"]), reverse=True)
+    return items[:limit]
 
-def call_grok_structured(model: str, items: list, start_date: datetime, end_date: datetime, damage_scope: str):
-    """
-    RSS'ten gelen linkleri Grok’a verip SADECE bu kaynaklara dayanarak
-    olay çıkarımı yaptırır. Çıkış: JSON array (olaylar).
-    """
-    system_prompt = f"""
-Sen bir sigorta uzmanısın. Aşağıda verilen TÜM kaynak linkleri ve özetler DIŞINA ÇIKMADAN,
-{start_date.strftime('%d %B %Y')} - {end_date.strftime('%d %B %Y')} tarihleri arasında
-Türkiye'de gerçekleşen '{damage_scope}' kapsamındaki endüstriyel hasarları tespit et.
-Uydurma yapma, kaynakta yoksa 'Teyit Edilemedi' de.
-
-Her olay için JSON nesnesi üret:
-[
-  {{
-    "olay_tarihi": "YYYY-MM-DD",
-    "sehir": "...",
-    "ilce": "...",
-    "adres_detay": "...",
-    "tesis_adi": "... | 'Teyit Edilemedi'",
-    "olay_tipi": "yangın|patlama|sızıntı|diğer",
-    "detay": "kısa özet",
-    "sigorta_degeri": "Yüksek|Orta|Düşük",
-    "tahmini_kayip": "metin (rakam varsa)",
-    "latitude": null,   // kaynakta yoksa null bırak
-    "longitude": null,  // kaynakta yoksa null bırak
-    "kaynaklar": ["link1", "link2", ...],
-    "dogruluk_notu": "Neden bu tesisi seçtin / neden teyit edilemedi?"
-  }},
-  ...
+# -------------------------------
+# GROK: TESIS ADI ÇIKARIMI
+# -------------------------------
+SCHEMA_EXAMPLE = [
+  {
+    "olay_tarihi": "2025-09-18",
+    "sehir": "Kayseri",
+    "ilce": "Melikgazi",
+    "tesis_adi": "Örnek Tekstil A.Ş. Fabrikası",
+    "tesis_ad_teyit": "TEYITLI | TAHMIN | TEYIT_EDILEMEDI",
+    "kanit_linkleri": ["https://yerelgazete.com.tr/...", "https://x.com/..."],
+    "aciklama": "Yerel haberde tesisin unvanı açıkça geçiyor. X hesabında itfaiye teyidi var.",
+    "guven_skoru": 0.92
+  }
 ]
 
+SYSTEM_PROMPT = """
+Sen bir sigorta uzmanısın ve canlı bilgiye erişebilen bir araştırmacı gibi davranacaksın.
+Aşağıda verilen HABER LİSTESİ, Türkiye'deki endüstriyel/sanayi olaylarına dair linklerden oluşur.
+Görevin: her linki **mümkünse yerel haber ve X paylaşımları ile teyit ederek** olay bazında TESİS ADI'nı çıkarmak.
 Kurallar:
-- Kaynağa dayanmayan bilgi ekleme.
-- Tesis adı net değilse 'Teyit Edilemedi'.
-- Kaynak sayısı < 1 ise olay üretme.
-- Zaman dışındaki haberleri dahil etme.
-- Sadece Türkiye sınırındaki olayları listele.
-- Yanıtın SADECE ham JSON dizi olsun.
+- Tesis adı net ve açık unvanla geçiyorsa "tesis_ad_teyit" = TEYITLI.
+- Sadece metinden tahmin ediliyorsa "TAHMIN".
+- Bulunamadıysa "TEYIT_EDILEMEDI".
+- Mümkünse en az 2 **kanıt_linki** ver (yerel haber + X postu/itfaiye/valilik).
+- Sadece Türkiye içindeki olaylar, son günlerdeki haberler.
+- Yanıt SADECE JSON dizi olsun; başka metin yok.
+- JSON alanları: olay_tarihi, sehir, ilce, tesis_adi, tesis_ad_teyit, kanit_linkleri, aciklama, guven_skoru.
+Dış doğrulama (web/X) yapabiliyorsan yap; yapamıyorsan link içeriğine ve başlığa dayan.
 """
 
-    # Items'ı kompakt bir listeye çevir
-    compact = []
-    for it in items:
-        compact.append(
-            {
-                "title": truncate(it["title"], 180),
-                "link": it["link"],
-                "published": it["published"].strftime("%Y-%m-%d %H:%M") if isinstance(it["published"], datetime) else "",
-                "summary": truncate(re.sub("<.*?>", "", it.get("summary", "") or ""), 500),
-                "source": it.get("source", "RSS"),
-            }
-        )
+def chunks(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
 
-    user_payload = {
-        "damage_scope": damage_scope,
-        "time_window": [start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")],
-        "items": compact[:60]  # güvenli sınır
-    }
-
+@st.cache_data(show_spinner=False, ttl=900)
+def grok_extract_facilities(model, batch_items):
+    # batch_items: list of dict {title, summary, link, published}
+    payload = []
+    for it in batch_items:
+        payload.append({
+            "title": unidecode(re.sub(r"<.*?>","", it["title"] or ""))[:220],
+            "summary": unidecode(re.sub(r"<.*?>","", it["summary"] or ""))[:600],
+            "link": it["link"],
+            "published": it["published"].strftime("%Y-%m-%d %H:%M") if isinstance(it["published"], datetime) else ""
+        })
     messages = [
-        {"role": "system", "content": system_prompt.strip()},
-        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)}
+        {"role":"system","content": SYSTEM_PROMPT.strip()},
+        {"role":"user","content": json.dumps({"haber_listesi": payload}, ensure_ascii=False)}
     ]
-
     resp = client.chat.completions.create(
         model=model,
         messages=messages,
-        max_tokens=3000,
-        temperature=0.0  # kaynağa sadakat için düşük
+        max_tokens=2200,
+        temperature=0.0
     )
     content = (resp.choices[0].message.content or "").strip()
-
-    # Sadece JSON dizi bekliyoruz
     m = re.search(r"\[.*\]\s*$", content, re.DOTALL)
     if not m:
         return []
-
     try:
         data = json.loads(m.group(0))
-        if isinstance(data, list):
-            return data
+        # şema güvenliği
+        out = []
+        for d in data:
+            out.append({
+                "olay_tarihi": d.get("olay_tarihi"),
+                "sehir": d.get("sehir"),
+                "ilce": d.get("ilce"),
+                "tesis_adi": d.get("tesis_adi"),
+                "tesis_ad_teyit": d.get("tesis_ad_teyit"),
+                "kanit_linkleri": d.get("kanit_linkleri", []),
+                "aciklama": d.get("aciklama"),
+                "guven_skoru": d.get("guven_skoru")
+            })
+        return out
     except Exception:
-        pass
-    return []
+        return []
 
-# =========================
-# SIDEBAR – Parametreler
-# =========================
+# -------------------------------
+# UI – Parametreler
+# -------------------------------
 with st.sidebar:
     st.header("Sorgu Ayarları")
-    today = datetime.now(timezone.utc)
-    end_date = st.date_input("Bitiş Tarihi", value=today.date())
-    days_back = st.slider("Geri Gün Sayısı", 1, 90, 30)
-    start_date = datetime.combine(end_date - timedelta(days=days_back), datetime.min.time()).replace(tzinfo=timezone.utc)
+    today = datetime.now(timezone.utc).date()
+    end_date = st.date_input("Bitiş Tarihi", value=today)
+    days_back = st.slider("Geri Gün", 1, 30, 7)
+    start_dt = datetime.combine(end_date - timedelta(days=days_back), datetime.min.time()).replace(tzinfo=timezone.utc)
     end_dt = datetime.combine(end_date, datetime.max.time()).replace(tzinfo=timezone.utc)
 
-    damage_type = st.selectbox("Hasar Tipi", ["Endüstriyel ve Enerji", "Sadece Endüstriyel"])
-
-    st.markdown("**Anahtar Kelime Grupları (TR)**")
-    default_keywords = [
-        "fabrika yangın",
-        "tesis yangın",
-        "sanayi yangını",
-        "OSB yangın",
-        "patlama fabrika",
-        "kimyasal sızıntı",
-        "rafineri yangın",
-        "enerji santrali yangın",
-        "trafo patlaması",
-        "üretim durdu",
+    st.markdown("**Anahtar Kelimeler (satır satır)**")
+    default_kws = [
+        "fabrika yangın", "tesis yangın", "sanayi yangını", "OSB yangın",
+        "patlama fabrika", "kimyasal sızıntı", "rafineri yangın", "trafo patlaması"
     ]
-    kw_text = st.text_area("Kelime listesi (satır satır)", value="\n".join(default_keywords), height=180)
+    kw_text = st.text_area("Kelimeler", "\n".join(default_kws), height=150)
+    only_local = st.checkbox("Sadece yerel domainleri Grok'a gönder", value=True)
+    max_links = st.slider("Grok'a gönderilecek link sayısı (toplam)", 5, 60, 25, step=5)
+    batch_size = st.slider("Batch boyutu (API tasarrufu)", 5, 25, 15, step=5)
+    model_name = st.selectbox("Grok Modeli", [DEFAULT_MODEL, "grok-4", "grok-4-fast-reasoning"], index=0)
 
-    uploaded_ref = st.file_uploader("Opsiyonel: Tesis referans listesi (CSV)", type=["csv"])
-
-    model_name = st.selectbox("Grok Modeli", [DEFAULT_MODEL, "grok-4-fast-reasoning", "grok-4"], index=0)
-
-    run_btn = st.button("Raporu Oluştur")
+run = st.button("Tesis Adlarını Çıkar (Grok)")
 
 st.markdown("---")
 
-# =========================
-# ÇALIŞTIR
-# =========================
-if run_btn:
+# -------------------------------
+# Çalıştırma
+# -------------------------------
+if run:
     keywords = [k.strip() for k in kw_text.splitlines() if k.strip()]
-    with st.spinner("RSS kaynakları taranıyor..."):
-        items = fetch_rss_articles(keywords, days_back=days_back, max_per_keyword=20)
-        items = filter_by_date(items, start_date, end_dt)
-        items = dedupe_articles(items)
-        items = sorted(items, key=lambda x: x["published"] or datetime(1970, 1, 1, tzinfo=timezone.utc), reverse=True)
+    with st.spinner("RSS kaynakları çekiliyor..."):
+        raw = fetch_rss(keywords, days_back=days_back, max_per_kw=20)
+    st.success(f"RSS'ten {len(raw)} aday haber geldi.")
 
-    st.success(f"RSS kaynaklarından {len(items)} aday haber çekildi.")
-    if not items:
+    picked = rank_and_pick(raw, start_dt, end_dt, limit=max_links, only_local=only_local)
+    if not picked:
+        st.warning("Seçilen aralık/filtre ile uygun yerel link bulunamadı. 'Sadece yerel' tikini kapatıp tekrar deneyin.")
         st.stop()
 
-    with st.spinner("Grok ile olay çıkarımı yapılıyor (kaynak bazlı, uydurma yok)..."):
-        events = call_grok_structured(model_name, items, start_date, end_dt, damage_type)
+    st.info(f"Grok'a gönderilecek link sayısı: {len(picked)} (batch={batch_size})")
+    df_src = pd.DataFrame([{
+        "published": it["published"],
+        "domain": urlparse(it["link"]).netloc if it["link"] else "",
+        "title": it["title"], "link": it["link"]
+    } for it in picked])
+    st.dataframe(df_src, use_container_width=True)
 
-    if not events:
-        st.warning("Kaynaklara dayalı bir olay çıkarılamadı.")
+    results = []
+    for chunk in chunks(picked, batch_size):
+        with st.spinner(f"Grok çıkarım yapıyor... ({len(chunk)} link)"):
+            out = grok_extract_facilities(model_name, chunk)
+            results.extend(out)
+        # nazik bekleme (kotaları zorlamamak için)
+        time.sleep(1.0)
+
+    if not results:
+        st.warning("Grok, verilen linklerden tesis adı çıkaramadı. Link sayısını artırın veya 'Sadece yerel' filtresini kapatıp yeniden deneyin.")
         st.stop()
 
-    # JSON -> DataFrame
-    df = pd.DataFrame(events)
-
-    # Tesis referans eşleştirme (opsiyonel)
-    ref_df = load_reference_facilities(uploaded_ref)
-    match_cols = ["ref_tesis_adi", "ref_sehir", "ref_ilce", "ref_adres", "match_score"]
-    for c in match_cols:
-        df[c] = None
-
-    if ref_df is not None and "tesis_adi" in ref_df.columns:
-        for i, row in df.iterrows():
-            name = row.get("tesis_adi") or ""
-            if name and name != "Teyit Edilemedi":
-                m = fuzzy_match_facility(name, ref_df, threshold=90)
-                if m:
-                    df.at[i, "ref_tesis_adi"] = m.get("tesis_adi")
-                    df.at[i, "ref_sehir"] = m.get("sehir")
-                    df.at[i, "ref_ilce"] = m.get("ilce")
-                    df.at[i, "ref_adres"] = m.get("adres")
-                    df.at[i, "match_score"] = m.get("match_score")
-
-    # Görüntüleme
-    st.subheader("📋 Olay Listesi (Kaynak Tabanlı)")
-    show_cols = [
-        "olay_tarihi", "sehir", "ilce", "tesis_adi", "olay_tipi",
-        "sigorta_degeri", "tahmini_kayip", "dogruluk_notu"
-    ]
-    for c in show_cols:
+    df = pd.DataFrame(results)
+    # Kolon düzeni
+    for c in ["olay_tarihi","sehir","ilce","tesis_adi","tesis_ad_teyit","guven_skoru","aciklama","kanit_linkleri"]:
         if c not in df.columns:
             df[c] = None
 
-    st.dataframe(df[show_cols], use_container_width=True)
+    st.subheader("🔎 Tesis Adı Çıkarımı – Sonuçlar")
+    st.dataframe(df[["olay_tarihi","sehir","ilce","tesis_adi","tesis_ad_teyit","guven_skoru","aciklama"]], use_container_width=True)
 
-    # Kaynak linkleri
-    st.subheader("🔗 Kaynaklar")
-    for idx, row in df.iterrows():
-        srcs = row.get("kaynaklar") or []
-        srcs = [s for s in srcs if isinstance(s, str)]
-        if not srcs:
-            continue
-        st.markdown(f"**Olay {idx+1}:** {truncate(str(row.get('tesis_adi') or 'Tesis bilinmiyor'), 60)}")
-        for s in srcs[:6]:
-            st.markdown(f"- {s}")
+    st.subheader("🔗 Kanıt Linkleri")
+    for i, row in df.iterrows():
+        links = row.get("kanit_linkleri") or []
+        if links:
+            st.markdown(f"**Olay {i+1} – {row.get('tesis_adi') or 'Tesis?'}**")
+            for L in links[:6]:
+                st.markdown(f"- {L}")
 
-    # Harita
-    st.subheader("🗺️ Harita Görselleştirme")
-    try:
-        map_df = df.dropna(subset=["latitude", "longitude"]).copy()
-        map_df["latitude"] = pd.to_numeric(map_df["latitude"], errors="coerce")
-        map_df["longitude"] = pd.to_numeric(map_df["longitude"], errors="coerce")
-        map_df = map_df.dropna(subset=["latitude", "longitude"])
-        if not map_df.empty:
-            center = [map_df["latitude"].mean(), map_df["longitude"].mean()]
-            m = folium.Map(location=center, zoom_start=6)
-            for _, r in map_df.iterrows():
-                popup = f"<b>{r.get('tesis_adi') or 'Tesis?'}</b><br>{r.get('olay_tarihi') or ''}<br>{truncate(r.get('detay') or '', 180)}"
-                folium.Marker(
-                    [float(r["latitude"]), float(r["longitude"])],
-                    popup=folium.Popup(popup, max_width=360),
-                    tooltip=r.get("olay_tipi") or "Olay"
-                ).add_to(m)
-            folium_static(m, width=1100, height=600)
-        else:
-            st.info("Konum verisi bulunamadı veya kaynaklarda yer almıyor.")
-    except Exception as e:
-        st.warning(f"Harita oluşturulurken hata: {e}")
-
-    # Rapor çıktısı (Markdown)
-    st.subheader("📝 Rapor (Markdown)")
-    # Markdown raporu Grok ile biçimlendir (sadece veriyi kullanarak)
-    try:
-        report_messages = [
-            {
-                "role": "system",
-                "content": f"""
-Sen bir sigorta uzmanısın. Aşağıdaki OLAY VERİLERİNE sadık kalarak,
-kronolojik bir Markdown raporu üret. Olaylar kaynak tabanlıdır; uydurma yapma.
-Her olay için: Tarih, Yer, Tesis Adı (Teyitli/Teyit Edilemedi), Detay, Sigortacılık Açısından Değer ve Tahmini Kayıp.
-Sonunda: Toplam kayıp tahmini (varsa) ve son dakika notu.
-"""
-            },
-            {"role": "user", "content": df.to_json(orient="records", force_ascii=False)}
-        ]
-        r = client.chat.completions.create(
-            model=model_name, messages=report_messages, max_tokens=2000, temperature=0.1
-        )
-        md = r.choices[0].message.content
-        st.markdown(md)
-    except Exception as e:
-        st.warning(f"Rapor üretiminde hata: {e}")
-
+    st.success("Tamam. Sonraki adımda bu sonuçları PD/BI analizi ve haritalama için kullanabiliriz.")
 else:
-    st.info("Soldan parametreleri seçip 'Raporu Oluştur' butonuna basın. İsterseniz tesis referans CSV’si yükleyip eşleştirme yapabilirsiniz.")
-    with st.expander("Nasıl çalışır?"):
-        st.markdown(
-            """
-- **RSS Toplama (deterministik):** Google News RSS üzerinden TR haberleri çekilir (site:tr).
-- **Kaynak Bazlı Çıkarım (Grok):** Haber linkleri ve özetleri Grok’a verilir; **sadece bu kaynaklara dayanarak** olay JSON’u üretilir.
-- **Teyit İlkesi:** Tesis adı net değilse **'Teyit Edilemedi'**. Uydurma yok.
-- **Opsiyonel Referans:** CSV tesis listesi yüklerseniz **fuzzy match** ile teyit skoru hesaplanır.
-- **Harita & Rapor:** Koordinatlar varsa harita, ardından Markdown raporu oluşturulur.
-"""
-        )
+    st.info("Parametreleri seçip 'Tesis Adlarını Çıkar (Grok)' butonuna basın. İlk adımda sadece tesis adı tespiti yapılır; API tüketimi batching ile sınırlıdır.")
