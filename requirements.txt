@@ -1,7 +1,9 @@
 streamlit
 langchain
 langchain-openai
-langchain_community
+langchain-community
 langchain-core
 tavily-python
 python-dotenv
+feedparser
+rapidfuzz
