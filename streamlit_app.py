@@ -1,218 +1,106 @@
 # ==============================================================================
-#  NİHAİ KOD (v44.0): Stabil Tesis Tespiti ve Yenilenmiş Arayüz
+#  NİHAİ KOD (v57.0): Otonom İstihbarat Ajanı Arayüzü
+#  MİMARİ: LangChain Agent (Beyin: Grok, Araç: Tavily)
+#  AMAÇ: Kullanıcının genel hedefini, otonom olarak araştırıp raporlayan bir
+#  Streamlit uygulaması sunmak.
 # ==============================================================================
 import streamlit as st
-import pandas as pd
-import feedparser
-from openai import OpenAI
-import json
-import re
-from urllib.parse import quote
-import folium
-from streamlit_folium import folium_static
-import requests
-from rapidfuzz import fuzz
-import time
+import os
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain_openai import ChatOpenAI
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_core.prompts import ChatPromptTemplate
+import io
+from contextlib import redirect_stdout
 
 # ------------------------------------------------------------------------------
-# 1. TEMEL AYARLAR
+# 1. TEMEL AYARLAR VE API ANAHTARLARI
 # ------------------------------------------------------------------------------
-st.set_page_config(layout="wide", page_title="Akıllı Hasar Tespiti")
-st.title("🛰️ Akıllı Endüstriyel Hasar Tespit Motoru")
+st.set_page_config(layout="wide", page_title="Otonom İstihbarat Ajanı")
+st.title("🛰️ Otonom İstihbarat Ajanı")
 
-grok_api_key = st.secrets.get("GROK_API_KEY")
-google_api_key = st.secrets.get("GOOGLE_MAPS_API_KEY")
-client = OpenAI(api_key=grok_api_key, base_url="https://api.x.ai/v1") if grok_api_key else None
+# --- API Anahtarlarını Streamlit Secrets'tan güvenli bir şekilde al
+TAVILY_API_KEY = st.secrets.get("TAVILY_API_KEY")
+GROK_API_KEY = st.secrets.get("GROK_API_KEY")
 
 # ------------------------------------------------------------------------------
-# 2. ÇEKİRDEK FONKSİYONLAR
+# 2. OTONOM AJANIN KURULUMU VE ÇALIŞTIRILMASI
 # ------------------------------------------------------------------------------
 
-@st.cache_data(ttl=900)
-def get_latest_events_from_rss_deduplicated():
-    """Google News RSS'ten en son olayları çeker, tarihe göre sıralar ve akıllıca tekilleştirir."""
-    locations = '"fabrika" OR "sanayi" OR "OSB" OR "liman" OR "depo"'
-    events = '"yangın" OR "patlama" OR "kaza" OR "sızıntı"'
-    q = f'({locations}) AND ({events})'
-    rss_url = f"https://news.google.com/rss/search?q={quote(q)}+when:3d&hl=tr&gl=TR&ceid=TR:tr"
-    
-    try:
-        feed = feedparser.parse(rss_url)
-        if not feed.entries:
-            return []
-        
-        # ÖNCE: Haberleri en yeniden en eskiye doğru sırala
-        sorted_entries = sorted(feed.entries, key=lambda e: getattr(e, 'published_parsed', time.gmtime(0)), reverse=True)
-        
-        unique_articles = []
-        seen_headlines = []
-        
-        # SONRA: Sıralanmış liste üzerinden tekilleştirme yap
-        for entry in sorted_entries:
-            headline = entry.title.split(" - ")[0].strip()
-            
-            if any(fuzz.ratio(headline, seen_headline) > 85 for seen_headline in seen_headlines):
-                continue
-
-            summary_text = re.sub('<[^<]+?>', '', entry.get('summary', ''))
-            unique_articles.append({
-                "headline": headline,
-                "summary": summary_text,
-                "url": entry.link
-            })
-            seen_headlines.append(headline)
-
-        return unique_articles[:15]
-    except Exception as e:
-        st.error(f"RSS akışı okunurken hata: {e}")
-        return []
-
-@st.cache_data(ttl=3600)
-def analyze_event_with_stable_engine(_client, headline, summary):
+@st.cache_data(ttl=3600) # Aynı sorgu için 1 saat boyunca sonucu hafızada tut
+def run_autonomous_agent(user_objective):
     """
-    Tesis adını bulmaya odaklanmış, "Düşünce Süreci" ve "Güven Skoru" içeren stabil analiz motoru.
+    Verilen hedef doğrultusunda, LangChain ile inşa edilmiş otonom bir ajanı çalıştırır.
+    Ajanın düşünce sürecini ve nihai çıktısını döndürür.
     """
-    prompt = f"""
-    Sen, internetin tamamını taramış elit bir istihbarat analistisin. Ana görevin, sana verilen ipuçlarından yola çıkarak olayın yaşandığı TESİSİN TİCARİ UNVANINI bulmaktır.
+    if not TAVILY_API_KEY or not GROK_API_KEY:
+        st.error("Lütfen hem Grok hem de Tavily API anahtarlarını Streamlit Secrets'a ekleyin.")
+        return None, None
 
-    SANA VERİLEN İPUÇLARI:
-    - BAŞLIK: "{headline}"
-    - ÖZET: "{summary}"
+    # 1. Adım: Ajanın Araçlarını Tanımla (Tavily Arama Motoru)
+    tools = [TavilySearchResults(max_results=7)]
 
-    DÜŞÜNCE SÜRECİN (ADIM ADIM):
-    1.  **Arama Sorgusu Oluştur:** İpuçlarından en etkili Google arama sorgusunu zihninde oluştur (örn: 'Gebze Kömürcüler OSB boya fabrikası yangın').
-    2.  **Arama Sonuçlarını Değerlendir:** Hafızandaki bilgilere dayanarak, bu arama sonucunda karşına çıkacak haber başlıklarını ve snippet'leri düşün. Hangi güvenilir haber kaynaklarının (AA, DHA, yerel basın, resmi kurumlar) hangi şirket ismini verdiğini analiz et.
-    3.  **Teyit ve Güven Skoru Ata:** Farklı ve bağımsız kaynakların aynı ismi verip vermediğini kontrol et. Teyit seviyesine göre 1 (zayıf) ile 5 (çok güçlü) arasında bir güven skoru belirle.
-    4.  **Raporla:** Tüm bu simülasyon sürecinden elde ettiğin kesinleşmiş bilgileri, aşağıdaki JSON formatına eksiksiz bir şekilde dök.
+    # 2. Adım: Ajanın Beynini Tanımla (Grok API)
+    llm = ChatOpenAI(
+        model_name="grok-4-fast-reasoning",
+        openai_api_key=GROK_API_KEY,
+        openai_api_base="https://api.x.ai/v1",
+        temperature=0,
+        streaming=False # Streamlit ile daha stabil çalışması için
+    )
 
-    JSON ÇIKTISI (SADECE JSON VER, AÇIKLAMA EKLEME):
-    {{
-      "tesis_adi": "Simülasyon sonucu bulunan en olası ticari unvan.",
-      "guven_skoru": "1-5 arası bir sayı.",
-      "kanit_zinciri": "Bu isme nasıl ulaştığının ve hangi kaynakların teyit ettiğinin detaylı açıklaması. Güven skorunun nedenini de belirt.",
-      "sehir_ilce": "Olayın yaşandığı yer.",
-      "olay_ozeti": "Olayın ne olduğu, fiziksel boyutu, nedeni ve sonuçları hakkında kısa ve net özet.",
-      "guncel_durum": "Üretim durması, müdahale durumu vb. en son bilgiler.",
-      "tahmini_koordinat": {{"lat": "...", "lon": "..."}}
-    }}
-    """
+    # 3. Adım: Ajanın Karakterini ve Görevini Tanımlayan Prompt'u Oluştur
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "Sen, Türkiye'deki endüstriyel hasarlar konusunda uzman bir istihbarat analistisin. Görevin, sana verilen hedef doğrultusunda, arama aracını kullanarak en kapsamlı ve doğru bilgiyi bulmaktır. Bulduğun her bir olay için mutlaka bir referans URL'i belirt. Cevabını her zaman Türkçe ve tüm olayları içeren tek bir Markdown tablosu formatında ver."),
+        ("human", "{input}"),
+        ("placeholder", "{agent_scratchpad}"),
+    ])
+
+    # 4. Adım: Ajanı İnşa Et
+    agent = create_tool_calling_agent(llm, tools, prompt)
+    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+    # 5. Adım: Ajanı Görevlendir ve Düşünce Sürecini Yakala
+    thought_process_stream = io.StringIO()
     try:
-        response = _client.chat.completions.create(model="grok-4-fast-reasoning", messages=[{"role": "user", "content": prompt}], max_tokens=4096, temperature=0.1)
-        content = response.choices[0].message.content
-        match = re.search(r'\{.*\}', content, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-        st.error(f"AI, geçerli bir JSON formatı üretemedi. Ham yanıt: {content}")
-        return None
-    except Exception as e:
-        st.error(f"AI Analizi sırasında hata oluştu: {e}")
-        return None
-
-@st.cache_data(ttl=86400)
-def find_neighboring_facilities(api_key, lat, lon):
-    if not all([api_key, lat, lon]): return []
-    try:
-        keywords = quote("fabrika|depo|sanayi|tesis|lojistik|antrepo")
-        url = f"https://maps.googleapis.com/maps/api/place/nearbysearch/json?location={float(lat)},{float(lon)}&radius=1000&keyword={keywords}&key={api_key}"
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        results = response.json().get('results', [])
-        return [{
-            "tesis_adi": p.get('name'), "adres": p.get('vicinity'), 
-            "lat": p.get('geometry',{}).get('location',{}).get('lat'),
-            "lng": p.get('geometry',{}).get('location',{}).get('lng')
-        } for p in results[:10]]
-    except Exception as e:
-        st.warning(f"Google Places API hatası: {e}")
-        return []
-
-# ------------------------------------------------------------------------------
-# 3. YENİLENMİŞ STREAMLIT ARAYÜZÜ
-# ------------------------------------------------------------------------------
-col1, col2 = st.columns([1, 2], gap="large")
-
-with col1:
-    st.header("📰 Son Olaylar")
-    with st.spinner("Güncel ve tekil haberler taranıyor..."):
-        events = get_latest_events_from_rss_deduplicated()
-    
-    if not events:
-        st.warning("Analiz edilecek yeni bir olay bulunamadı.")
-    else:
-        # YENİ ARAYÜZ: Her haber için tıklanabilir kartlar
-        for event in events:
-            with st.container(border=True):
-                st.markdown(f"**{event['headline']}**")
-                if st.button("Bu Haberi Seç", key=event['url'], use_container_width=True):
-                    st.session_state.selected_event = event
-                    # Raporu temizle
-                    if 'report' in st.session_state:
-                        del st.session_state.report
-                    st.rerun()
-
-with col2:
-    st.header("📝 Analiz Paneli")
-    if 'selected_event' not in st.session_state:
-        st.info("Lütfen sol panelden analiz etmek için bir haber seçin.")
-    else:
-        event = st.session_state.selected_event
-        st.subheader(event['headline'])
-        st.caption(f"Kaynak: [{event['url']}]({event['url']})")
+        with redirect_stdout(thought_process_stream):
+            result = agent_executor.invoke({"input": user_objective})
         
-        if st.button("🤖 Bu Olayı Analiz Et", type="primary", use_container_width=True):
-            if not client:
-                st.error("Lütfen Grok API anahtarını Streamlit Secrets'a ekleyin.")
-            else:
-                with st.spinner("AI, Google Arama simülasyonu ile istihbarat topluyor..."):
-                    report = analyze_event_with_stable_engine(client, event['headline'], event['summary'])
-                    if report and report.get('tahmini_koordinat'):
-                        coords = report.get('tahmini_koordinat', {})
-                        lat, lon = coords.get('lat'), coords.get('lon')
-                        if lat and lon:
-                            report['komsu_tesisler'] = find_neighboring_facilities(google_api_key, lat, lon)
-                    st.session_state.report = report
+        thought_process = thought_process_stream.getvalue()
+        final_output = result.get("output", "Bir çıktı üretilemedi.")
+        return final_output, thought_process
+        
+    except Exception as e:
+        st.error(f"Ajan çalışırken bir hata oluştu: {e}")
+        return None, thought_process_stream.getvalue()
 
-        if 'report' in st.session_state and st.session_state.report:
-            report = st.session_state.report
-            st.markdown("---")
-            
-            col_title, col_score = st.columns([4, 1])
-            with col_title:
-                st.subheader(f"Rapor: {report.get('tesis_adi', 'Teyit Edilemedi')}")
-            with col_score:
-                score = report.get('guven_skoru', 0)
-                st.metric(label="Güven Skoru", value=f"{score}/5", help="AI'ın bu tespiti yaparkenki güven seviyesi (1=Zayıf, 5=Çok Güçlü)")
+# ------------------------------------------------------------------------------
+# 3. STREAMLIT ARAYÜZÜ
+# ------------------------------------------------------------------------------
 
-            st.info(f"**Kanıt Zinciri:** {report.get('kanit_zinciri', 'N/A')}")
-            
-            st.success(f"**Güncel Durum:** {report.get('guncel_durum', 'N/A')}")
-            st.warning(f"**Olay Özeti:** {report.get('olay_ozeti', 'N/A')}")
-            
-            with st.expander("Olay Yeri Haritası ve Çevre Analizi", expanded=True):
-                coords = report.get('tahmini_koordinat', {})
-                lat, lon = coords.get('lat'), coords.get('lon')
-                if lat and lon:
-                    try:
-                        m = folium.Map(location=[float(lat), float(lon)], zoom_start=14, tiles="CartoDB positron")
-                        folium.Marker([float(lat), float(lon)], 
-                                      popup=f"<b>{report.get('tesis_adi')}</b>", 
-                                      icon=folium.Icon(color='red', icon='fire')).add_to(m)
-                        
-                        neighbors = report.get('komsu_tesisler', [])
-                        for neighbor in neighbors:
-                            if neighbor.get('lat') and neighbor.get('lng'):
-                                folium.Marker([neighbor['lat'], neighbor['lng']], 
-                                              popup=f"<b>{neighbor['tesis_adi']}</b><br>{neighbor.get('adres', '')}", 
-                                              tooltip=neighbor['tesis_adi'],
-                                              icon=folium.Icon(color='blue', icon='industry', prefix='fa')).add_to(m)
-                        
-                        folium_static(m, height=400)
+st.subheader("1. Adım: Ajanın Ana Görevini Belirleyin")
+default_objective = "Türkiye'de son 45 günde (bugün 22 Eylül 2025) gerçekleşmiş, basına yansımış tüm endüstriyel hasarları (fabrika, depo, OSB, liman, maden, rafineri) bul. Her olay için tesis adını, olayın kısa özetini, biliniyorsa etkilerini ve en güvenilir referans URL'ini içeren, duplikeleri temizlenmiş bir Markdown tablosu oluştur."
 
-                        if neighbors:
-                            st.write("Yakın Çevredeki Tesisler (1km - Google Maps Verisi)")
-                            st.dataframe(pd.DataFrame(neighbors)[['tesis_adi', 'adres']])
+user_objective = st.text_area(
+    "Ajanın araştırmasını istediğiniz ana hedefi girin:",
+    default_objective,
+    height=150
+)
 
-                    except (ValueError, TypeError):
-                        st.warning("Rapor koordinatları geçersiz, harita çizilemiyor.")
-                else:
-                    st.info("Rapor, harita çizimi için koordinat bilgisi içermiyor.")
+st.subheader("2. Adım: Ajanı Başlatın")
+if st.button("Otonom Araştırmayı Başlat", type="primary", use_container_width=True):
+    with st.spinner("Otonom Ajan çalışıyor... Bu işlem, araştırmanın derinliğine göre birkaç dakika sürebilir. Ajan, en iyi sonuçları bulmak için arka planda birden çok arama yapmaktadır."):
+        final_report, thought_process = run_autonomous_agent(user_objective)
+        st.session_state.final_report = final_report
+        st.session_state.thought_process = thought_process
+
+# --- SONUÇLARI GÖSTER ---
+if 'final_report' in st.session_state and st.session_state.final_report:
+    st.markdown("---")
+    st.subheader("Ajanın Nihai Raporu")
+    st.markdown(st.session_state.final_report)
+
+    with st.expander("Ajanın Düşünce Sürecini Göster (Şeffaflık Raporu)"):
+        st.text_area("Ajanın Adım Adım Düşünceleri ve Yaptığı Aramalar:", 
+                     st.session_state.get('thought_process', 'Düşünce süreci kaydedilemedi.'), 
+                     height=400)
