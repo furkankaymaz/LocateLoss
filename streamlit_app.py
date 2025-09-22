@@ -1,7 +1,8 @@
 # ==============================================================================
-#  NİHAİ KOD (v60.0): Rafine Edilmiş Otonom Ajan
-#  FELSEFE: Ajan'a katı kurallar yerine, bir "Görev" ve "Yol Gösterici İlkeler"
-#  vererek, otonom ve yaratıcı araştırma yeteneğini en üst düzeye çıkarmak.
+#  NİHAİ KOD (v57.0) Otonom İstihbarat Ajanı Arayüzü
+#  MİMARİ LangChain Agent (Beyin Grok, Araç Tavily)
+#  AMAÇ Kullanıcının genel hedefini, otonom olarak araştırıp raporlayan bir
+#  Streamlit uygulaması sunmak.
 # ==============================================================================
 import streamlit as st
 import os
@@ -11,109 +12,95 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_core.prompts import ChatPromptTemplate
 import io
 from contextlib import redirect_stdout
-from datetime import datetime, timedelta
 
 # ------------------------------------------------------------------------------
-# 1. TEMEL AYARLAR
+# 1. TEMEL AYARLAR VE API ANAHTARLARI
 # ------------------------------------------------------------------------------
-st.set_page_config(layout="wide", page_title="Rafine Edilmiş Otonom Ajan")
-st.title("🛰️ Rafine Edilmiş Otonom İstihbarat Ajanı")
-st.info("Bu ajan, verilen görev tanımı çerçevesinde, en güncel ve önemli endüstriyel hasarları bulmak için otonom olarak en iyi araştırma stratejisini belirler ve uygular.")
+st.set_page_config(layout=wide, page_title=Otonom İstihbarat Ajanı)
+st.title(🛰️ Otonom İstihbarat Ajanı)
 
-# --- API Anahtarları
-TAVILY_API_KEY = st.secrets.get("TAVILY_API_KEY")
-GROK_API_KEY = st.secrets.get("GROK_API_KEY")
+# --- API Anahtarlarını Streamlit Secrets'tan güvenli bir şekilde al
+TAVILY_API_KEY = st.secrets.get(TAVILY_API_KEY)
+GROK_API_KEY = st.secrets.get(GROK_API_KEY)
 
 # ------------------------------------------------------------------------------
 # 2. OTONOM AJANIN KURULUMU VE ÇALIŞTIRILMASI
 # ------------------------------------------------------------------------------
 
-@st.cache_data(ttl=3600) # Aynı görev için sonucu 1 saat hafızada tut
-def run_refined_agent(user_objective):
-    """
-    Rafine edilmiş bir prompt ile otonom ajanı çalıştırır.
-    """
-    if not TAVILY_API_KEY or not GROK_API_KEY:
-        st.error("Lütfen hem Grok hem de Tavily API anahtarlarını Streamlit Secrets'a ekleyin.")
+@st.cache_data(ttl=3600) # Aynı sorgu için 1 saat boyunca sonucu hafızada tut
+def run_autonomous_agent(user_objective)
+    
+    Verilen hedef doğrultusunda, LangChain ile inşa edilmiş otonom bir ajanı çalıştırır.
+    Ajanın düşünce sürecini ve nihai çıktısını döndürür.
+    
+    if not TAVILY_API_KEY or not GROK_API_KEY
+        st.error(Lütfen hem Grok hem de Tavily API anahtarlarını Streamlit Secrets'a ekleyin.)
         return None, None
 
-    # Araç, optimize edilmiş sabit bir derinlikle yapılandırıldı.
+    # 1. Adım Ajanın Araçlarını Tanımla (Tavily Arama Motoru)
     tools = [TavilySearchResults(max_results=7)]
 
+    # 2. Adım Ajanın Beynini Tanımla (Grok API)
     llm = ChatOpenAI(
-        model_name="grok-4-fast-reasoning",
+        model_name=grok-4-fast-reasoning,
         openai_api_key=GROK_API_KEY,
-        openai_api_base="https://api.x.ai/v1",
+        openai_api_base=httpsapi.x.aiv1,
         temperature=0,
-        streaming=False
+        streaming=False # Streamlit ile daha stabil çalışması için
     )
 
-    # GÜNCELLEME: Prompt, katı kurallar yerine bir görev tanımı ve yol gösterici ilkeler içerir.
-    # Bu, ajanın esnek ve akıllı düşünmesini sağlar.
+    # 3. Adım Ajanın Karakterini ve Görevini Tanımlayan Prompt'u Oluştur
     prompt = ChatPromptTemplate.from_messages([
-        ("system", """Sen, Türkiye'deki güncel endüstriyel hasarlar konusunda uzman, sıfır halüsinasyon ilkesiyle çalışan bir OSINT analistisin.
-
-        ANA GÖREVİN (MİSYON): Sana verilen zaman aralığı içinde Türkiye'de gerçekleşmiş, sigortacılık açısından önemli tüm endüstriyel hasarları (fabrika, depo, OSB, liman, maden vb.) bulmak ve raporlamak.
-
-        YOL GÖSTERİCİ İLKELERİN:
-        1.  **Kapsamlı Ol:** Sadece bir iki olay bulup durma. Görevin, mümkün olan en fazla sayıda anlamlı olayı ortaya çıkarmak. Bunun için farklı anahtar kelimelerle birden çok arama yapmaktan çekinme.
-        2.  **Tesis Adı Önceliği:** Raporunun en değerli kısmı tesis adıdır. Teyit edilmiş bir ticari unvan bulmak için tüm kanıtları dikkatle incele. Sadece hiçbir ipucu bulamazsan 'Belirtilmemiş' olarak raporla.
-        3.  **Güncelliği Koru:** Sadece sana belirtilen tarih aralığına odaklan. Bu aralığın dışındaki olaylar ilgisizdir.
-        4.  **Kanıta Daya:** Her bir bilgiyi, arama sonuçlarından bulduğun bir kaynağa dayandır.
-        5.  **Standartlara Uy:** Nihai çıktın, SADECE istenen formatta bir Markdown tablosu olmalıdır.
-
-        İSTENEN ÇIKTI FORMATI:
-        | Sıra | Tarih | Şirket Adı | Açıklama ve Teyit | Hasarın Etkisi | Etkilenen Çevre Tesisleri (Detaylı Etki) | Referans URL |
-        |------|-------|------------|-------------------|----------------|-------------------------------------------|--------------|
-        """),
-        ("human", "{input}"),
-        ("placeholder", "{agent_scratchpad}"),
+        (system, Sen, Türkiye'deki endüstriyel hasarlar konusunda uzman bir istihbarat analistisin. Görevin, sana verilen hedef doğrultusunda, arama aracını kullanarak en kapsamlı ve doğru bilgiyi bulmaktır. Bulduğun her bir olay için mutlaka bir referans URL'i belirt. Cevabını her zaman Türkçe ve tüm olayları içeren tek bir Markdown tablosu formatında ver.),
+        (human, {input}),
+        (placeholder, {agent_scratchpad}),
     ])
 
+    # 4. Adım Ajanı İnşa Et
     agent = create_tool_calling_agent(llm, tools, prompt)
-    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
+    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
 
+    # 5. Adım Ajanı Görevlendir ve Düşünce Sürecini Yakala
     thought_process_stream = io.StringIO()
-    try:
-        with redirect_stdout(thought_process_stream):
-            result = agent_executor.invoke({"input": user_objective})
+    try
+        with redirect_stdout(thought_process_stream)
+            result = agent_executor.invoke({input user_objective})
         
         thought_process = thought_process_stream.getvalue()
-        final_output = result.get("output", "Bir çıktı üretilemedi.")
+        final_output = result.get(output, Bir çıktı üretilemedi.)
         return final_output, thought_process
         
-    except Exception as e:
-        st.error(f"Ajan çalışırken bir hata oluştu: {e}")
+    except Exception as e
+        st.error(fAjan çalışırken bir hata oluştu {e})
         return None, thought_process_stream.getvalue()
 
 # ------------------------------------------------------------------------------
 # 3. STREAMLIT ARAYÜZÜ
 # ------------------------------------------------------------------------------
-# Tarih aralığını dinamik olarak hesapla
-today = datetime.now()
-start_date = today - timedelta(days=45)
-date_range_str = f"{start_date.strftime('%d %B %Y')} - {today.strftime('%d %B %Y')}"
 
-st.subheader(f"Görev: {date_range_str} Arası Endüstriyel Hasar Taraması")
+st.subheader(1. Adım Ajanın Ana Görevini Belirleyin)
+default_objective = Türkiye'de son 45 günde (bugün 22 Eylül 2025) gerçekleşmiş, basına yansımış tüm endüstriyel hasarları (fabrika, depo, OSB, liman, maden, rafineri) bul. Her olay için tesis adını, olayın kısa özetini, biliniyorsa etkilerini ve en güvenilir referans URL'ini içeren, duplikeleri temizlenmiş bir Markdown tablosu oluştur.
 
-# Ajanın ana hedefi artık sabit, net ve optimize edilmiş.
-user_objective = f"Türkiye'de {date_range_str} tarihleri arasında gerçekleşmiş, basına yansımış (X dahil), sigortacılık açısından önemli tüm endüstriyel hasarları bul ve raporla."
+user_objective = st.text_area(
+    Ajanın araştırmasını istediğiniz ana hedefi girin,
+    default_objective,
+    height=150
+)
 
-st.write("Aşağıdaki butona bastığınızda, ajan belirtilen tarihler arasındaki en güncel ve önemli endüstriyel hasarları bulmak için otonom bir araştırma başlatacaktır.")
-
-if st.button("Güncel Hasar Raporunu Oluştur", type="primary", use_container_width=True):
-    with st.spinner("Uzman Ajan çalışıyor... En iyi stratejiyi belirleyip, güncel olayları bulmak için kaynakları tarıyor. Bu işlem birkaç dakika sürebilir."):
-        final_report, thought_process = run_refined_agent(user_objective)
+st.subheader(2. Adım Ajanı Başlatın)
+if st.button(Otonom Araştırmayı Başlat, type=primary, use_container_width=True)
+    with st.spinner(Otonom Ajan çalışıyor... Bu işlem, araştırmanın derinliğine göre birkaç dakika sürebilir. Ajan, en iyi sonuçları bulmak için arka planda birden çok arama yapmaktadır.)
+        final_report, thought_process = run_autonomous_agent(user_objective)
         st.session_state.final_report = final_report
         st.session_state.thought_process = thought_process
 
 # --- SONUÇLARI GÖSTER ---
-if 'final_report' in st.session_state and st.session_state.final_report:
-    st.markdown("---")
-    st.subheader("Ajanın Nihai Raporu")
+if 'final_report' in st.session_state and st.session_state.final_report
+    st.markdown(---)
+    st.subheader(Ajanın Nihai Raporu)
     st.markdown(st.session_state.final_report)
 
-    with st.expander("Ajanın Düşünce Sürecini Göster (Şeffaf Rapor)"):
-        st.text_area("Ajanın Adım Adım Düşünceleri ve Yaptığı Aramalar:", 
+    with st.expander(Ajanın Düşünce Sürecini Göster (Şeffaflık Raporu))
+        st.text_area(Ajanın Adım Adım Düşünceleri ve Yaptığı Aramalar, 
                      st.session_state.get('thought_process', 'Düşünce süreci kaydedilemedi.'), 
                      height=400)
