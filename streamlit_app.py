@@ -1,134 +1,218 @@
 # ==============================================================================
-#           NİHAİ KOD (v4): GELİŞMİŞ PROMPT VE "SON 10 OLAY" MANTIĞI
+#  NİHAİ KOD (v44.0): Stabil Tesis Tespiti ve Yenilenmiş Arayüz
 # ==============================================================================
 import streamlit as st
 import pandas as pd
-from datetime import datetime, timedelta
-import folium
-from streamlit_folium import folium_static
+import feedparser
 from openai import OpenAI
 import json
 import re
+from urllib.parse import quote
+import folium
+from streamlit_folium import folium_static
+import requests
+from rapidfuzz import fuzz
+import time
 
 # ------------------------------------------------------------------------------
-# 1. TEMEL AYARLAR VE API ANAHTARI KONTROLÜ
+# 1. TEMEL AYARLAR
 # ------------------------------------------------------------------------------
+st.set_page_config(layout="wide", page_title="Akıllı Hasar Tespiti")
+st.title("🛰️ Akıllı Endüstriyel Hasar Tespit Motoru")
 
-st.set_page_config(layout="wide")
-st.title("🚨 Endüstriyel Hasar Analiz Paneli")
-st.markdown("---")
-
-API_SERVICE = "Grok_XAI" 
-
-API_CONFIGS = {
-    "Groq": {
-        "base_url": "https://api.groq.com/openai/v1",
-        "model": "llama3-70b-8192",
-    },
-    "Grok_XAI": {
-        "base_url": "https://api.x.ai/v1",
-        "model": "grok-4-fast-reasoning", 
-    }
-}
-SELECTED_CONFIG = API_CONFIGS[API_SERVICE]
-API_KEY_NAME = "GROK_API_KEY"
-
-api_key = st.secrets.get(API_KEY_NAME)
+grok_api_key = st.secrets.get("GROK_API_KEY")
+google_api_key = st.secrets.get("GOOGLE_MAPS_API_KEY")
+client = OpenAI(api_key=grok_api_key, base_url="https://api.x.ai/v1") if grok_api_key else None
 
 # ------------------------------------------------------------------------------
-# 2. API ANAHTARINI DOĞRULAMA FONKSİYONU
+# 2. ÇEKİRDEK FONKSİYONLAR
 # ------------------------------------------------------------------------------
+
+@st.cache_data(ttl=900)
+def get_latest_events_from_rss_deduplicated():
+    """Google News RSS'ten en son olayları çeker, tarihe göre sıralar ve akıllıca tekilleştirir."""
+    locations = '"fabrika" OR "sanayi" OR "OSB" OR "liman" OR "depo"'
+    events = '"yangın" OR "patlama" OR "kaza" OR "sızıntı"'
+    q = f'({locations}) AND ({events})'
+    rss_url = f"https://news.google.com/rss/search?q={quote(q)}+when:3d&hl=tr&gl=TR&ceid=TR:tr"
+    
+    try:
+        feed = feedparser.parse(rss_url)
+        if not feed.entries:
+            return []
+        
+        # ÖNCE: Haberleri en yeniden en eskiye doğru sırala
+        sorted_entries = sorted(feed.entries, key=lambda e: getattr(e, 'published_parsed', time.gmtime(0)), reverse=True)
+        
+        unique_articles = []
+        seen_headlines = []
+        
+        # SONRA: Sıralanmış liste üzerinden tekilleştirme yap
+        for entry in sorted_entries:
+            headline = entry.title.split(" - ")[0].strip()
+            
+            if any(fuzz.ratio(headline, seen_headline) > 85 for seen_headline in seen_headlines):
+                continue
+
+            summary_text = re.sub('<[^<]+?>', '', entry.get('summary', ''))
+            unique_articles.append({
+                "headline": headline,
+                "summary": summary_text,
+                "url": entry.link
+            })
+            seen_headlines.append(headline)
+
+        return unique_articles[:15]
+    except Exception as e:
+        st.error(f"RSS akışı okunurken hata: {e}")
+        return []
 
 @st.cache_data(ttl=3600)
-def validate_api_key(key, base_url, model):
-    if not key:
-        return False, f"**{API_KEY_NAME}** adında bir anahtar Streamlit Secrets içinde bulunamadı.", "Lütfen Streamlit Cloud'da uygulamanızın 'Settings > Secrets' bölümüne giderek anahtarınızı ekleyin."
-    try:
-        client = OpenAI(api_key=key, base_url=base_url)
-        client.chat.completions.create(model=model, messages=[{"role": "user", "content": "Merhaba"}], max_tokens=10)
-        return True, f"API anahtarı doğrulandı ve **{API_SERVICE} ({model})** servisine başarıyla bağlandı!", ""
-    except Exception as e:
-        # Hata mesajlarını daha kullanıcı dostu hale getirelim
-        error_message = str(e)
-        if "401" in error_message:
-            return False, "API Anahtarı Geçersiz (Hata 401).", f"Streamlit Secrets'e eklediğiniz anahtar **{API_SERVICE}** servisi tarafından reddedildi."
-        elif "404" in error_message and "does not exist" in error_message:
-            return False, f"Model Bulunamadı (Hata 404).", f"İstenen '{model}' modeli mevcut değil veya hesabınızın bu modele erişim izni yok."
-        else:
-            return False, "Bilinmeyen bir API hatası oluştu.", f"Hata detayı: {error_message}"
-
-# ------------------------------------------------------------------------------
-# 3. UYGULAMA AKIŞI: ÖNCE TEST ET, SONRA ÇALIŞTIR
-# ------------------------------------------------------------------------------
-
-st.subheader("⚙️ API Bağlantı Durumu")
-is_valid, status_message, solution_message = validate_api_key(api_key, SELECTED_CONFIG["base_url"], SELECTED_CONFIG["model"])
-
-if is_valid:
-    st.success(f"✅ **BAŞARILI:** {status_message}")
-else:
-    st.error(f"❌ **HATA:** {status_message}")
-    st.warning(f"👉 **ÇÖZÜM ÖNERİSİ:** {solution_message}")
-    st.stop()
-
-# --- Buradan Sonrası Sadece API Testi Başarılı Olduğunda Çalışır ---
-st.markdown("---")
-st.header("En Son Endüstriyel Hasarlar Raporu")
-
-@st.cache_data(ttl=3600) # Verileri saatte bir yenile
-def get_industrial_events(key, base_url, model):
-    client = OpenAI(api_key=key, base_url=base_url)
-    
-    # !!! YENİ VE GELİŞTİRİLMİŞ PROMPT !!!
-    # Modelin X (Twitter) entegrasyonunu ve gerçek zamanlı arama yeteneğini kullanmasını sağlıyoruz.
-    # "Son 30 gün" kısıtlamasını kaldırıp "en son 10 olay" mantığına geçiyoruz.
+def analyze_event_with_stable_engine(_client, headline, summary):
+    """
+    Tesis adını bulmaya odaklanmış, "Düşünce Süreci" ve "Güven Skoru" içeren stabil analiz motoru.
+    """
     prompt = f"""
-    Sen, Türkiye'deki endüstriyel riskleri anlık olarak takip eden ve X (Twitter) entegrasyonunu aktif olarak kullanan bir hasar tespit uzmanısın.
-    Görevin, Türkiye'de meydana gelmiş **en son 10 önemli** endüstriyel olayı (yangın, patlama, kimyasal sızıntı vb.) bulmaktır. Tarih aralığı önemli değil, en güncelden geriye doğru git.
-    Bu tespiti yaparken, özellikle son dakika haber ajansları (AA, DHA), güvenilir gazetecilerin ve resmi kurumların (valilik, itfaiye) X (Twitter) hesaplarındaki paylaşımları ve teyitli web haberlerini öncelikli olarak kullan.
-    Sadece sigortacılık açısından anlamlı (büyük maddi hasar, üretim durması, can kaybı) olayları dikkate al.
-    Bulgularını, bir JSON dizisi (array) olarak döndür. SADECE HAM JSON DİZİSİNİ ÇIKTI VER, başka hiçbir metin ekleme.
-    JSON Nesne Yapısı: ["olay_tarihi", "olay_tipi", "tesis_adi_turu", "adres_detay", "sehir", "ilce", "latitude", "longitude", "hasar_etkisi", "dogruluk_orani", "kaynaklar", "komsu_tesisler_risk_analizi"].
-    Eğer olay bulamazsan, boş bir JSON dizisi döndür: [].
+    Sen, internetin tamamını taramış elit bir istihbarat analistisin. Ana görevin, sana verilen ipuçlarından yola çıkarak olayın yaşandığı TESİSİN TİCARİ UNVANINI bulmaktır.
+
+    SANA VERİLEN İPUÇLARI:
+    - BAŞLIK: "{headline}"
+    - ÖZET: "{summary}"
+
+    DÜŞÜNCE SÜRECİN (ADIM ADIM):
+    1.  **Arama Sorgusu Oluştur:** İpuçlarından en etkili Google arama sorgusunu zihninde oluştur (örn: 'Gebze Kömürcüler OSB boya fabrikası yangın').
+    2.  **Arama Sonuçlarını Değerlendir:** Hafızandaki bilgilere dayanarak, bu arama sonucunda karşına çıkacak haber başlıklarını ve snippet'leri düşün. Hangi güvenilir haber kaynaklarının (AA, DHA, yerel basın, resmi kurumlar) hangi şirket ismini verdiğini analiz et.
+    3.  **Teyit ve Güven Skoru Ata:** Farklı ve bağımsız kaynakların aynı ismi verip vermediğini kontrol et. Teyit seviyesine göre 1 (zayıf) ile 5 (çok güçlü) arasında bir güven skoru belirle.
+    4.  **Raporla:** Tüm bu simülasyon sürecinden elde ettiğin kesinleşmiş bilgileri, aşağıdaki JSON formatına eksiksiz bir şekilde dök.
+
+    JSON ÇIKTISI (SADECE JSON VER, AÇIKLAMA EKLEME):
+    {{
+      "tesis_adi": "Simülasyon sonucu bulunan en olası ticari unvan.",
+      "guven_skoru": "1-5 arası bir sayı.",
+      "kanit_zinciri": "Bu isme nasıl ulaştığının ve hangi kaynakların teyit ettiğinin detaylı açıklaması. Güven skorunun nedenini de belirt.",
+      "sehir_ilce": "Olayın yaşandığı yer.",
+      "olay_ozeti": "Olayın ne olduğu, fiziksel boyutu, nedeni ve sonuçları hakkında kısa ve net özet.",
+      "guncel_durum": "Üretim durması, müdahale durumu vb. en son bilgiler.",
+      "tahmini_koordinat": {{"lat": "...", "lon": "..."}}
+    }}
     """
     try:
-        response = client.chat.completions.create(model=model, messages=[{"role": "user", "content": prompt}], max_tokens=8192, temperature=0.1)
-        content = response.choices[0].message.content.strip()
-        match = re.search(r'\[.*\]', content, re.DOTALL)
+        response = _client.chat.completions.create(model="grok-4-fast-reasoning", messages=[{"role": "user", "content": prompt}], max_tokens=4096, temperature=0.1)
+        content = response.choices[0].message.content
+        match = re.search(r'\{.*\}', content, re.DOTALL)
         if match:
-            df = pd.DataFrame(json.loads(match.group(0)))
-            if not df.empty:
-                df['olay_tarihi'] = pd.to_datetime(df['olay_tarihi'])
-                df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
-                df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
-                # En güncel olayların üstte olması için sıralama
-                df = df.sort_values(by='olay_tarihi', ascending=False).reset_index(drop=True)
-            return df
-        return pd.DataFrame()
+            return json.loads(match.group(0))
+        st.error(f"AI, geçerli bir JSON formatı üretemedi. Ham yanıt: {content}")
+        return None
     except Exception as e:
-        st.error(f"Veri çekme sırasında hata oluştu: {e}")
-        return pd.DataFrame()
+        st.error(f"AI Analizi sırasında hata oluştu: {e}")
+        return None
 
-if st.button("Son 10 Olayı Analiz Et", type="primary"):
-    with st.spinner("Yapay zeka ile X (Twitter) ve web kaynakları taranıyor... Bu işlem 1-2 dakika sürebilir."):
-        events_df = get_industrial_events(api_key, SELECTED_CONFIG["base_url"], SELECTED_CONFIG["model"])
+@st.cache_data(ttl=86400)
+def find_neighboring_facilities(api_key, lat, lon):
+    if not all([api_key, lat, lon]): return []
+    try:
+        keywords = quote("fabrika|depo|sanayi|tesis|lojistik|antrepo")
+        url = f"https://maps.googleapis.com/maps/api/place/nearbysearch/json?location={float(lat)},{float(lon)}&radius=1000&keyword={keywords}&key={api_key}"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        results = response.json().get('results', [])
+        return [{
+            "tesis_adi": p.get('name'), "adres": p.get('vicinity'), 
+            "lat": p.get('geometry',{}).get('location',{}).get('lat'),
+            "lng": p.get('geometry',{}).get('location',{}).get('lng')
+        } for p in results[:10]]
+    except Exception as e:
+        st.warning(f"Google Places API hatası: {e}")
+        return []
 
-    if not events_df.empty:
-        st.success(f"{len(events_df)} adet önemli olay tespit edildi.")
-        st.subheader("Tespit Edilen Son Olaylar Listesi")
-        st.dataframe(events_df)
-        st.subheader("Olayların Harita Üzerinde Gösterimi")
-        map_df = events_df.dropna(subset=['latitude', 'longitude'])
-        if not map_df.empty:
-            map_center = [map_df['latitude'].mean(), map_df['longitude'].mean()]
-            m = folium.Map(location=map_center, zoom_start=6)
-            for _, row in map_df.iterrows():
-                popup_html = f"<b>Tesis:</b> {row['tesis_adi_turu']}<br><b>Tarih:</b> {row['olay_tarihi'].strftime('%Y-%m-%d')}<br><b>Etki:</b> {str(row['hasar_etkisi'])[:200]}..."
-                folium.Marker([row['latitude'], row['longitude']], popup=folium.Popup(popup_html, max_width=350), tooltip=row['tesis_adi_turu']).add_to(m)
-            folium_static(m, width=1100, height=600)
-        else:
-            st.warning("Harita üzerinde gösterilecek geçerli konum verisi bulunamadı.")
+# ------------------------------------------------------------------------------
+# 3. YENİLENMİŞ STREAMLIT ARAYÜZÜ
+# ------------------------------------------------------------------------------
+col1, col2 = st.columns([1, 2], gap="large")
+
+with col1:
+    st.header("📰 Son Olaylar")
+    with st.spinner("Güncel ve tekil haberler taranıyor..."):
+        events = get_latest_events_from_rss_deduplicated()
+    
+    if not events:
+        st.warning("Analiz edilecek yeni bir olay bulunamadı.")
     else:
-        st.info("Belirtilen kriterlere uygun, raporlanacak bir endüstriyel olay tespit edilemedi.")
+        # YENİ ARAYÜZ: Her haber için tıklanabilir kartlar
+        for event in events:
+            with st.container(border=True):
+                st.markdown(f"**{event['headline']}**")
+                if st.button("Bu Haberi Seç", key=event['url'], use_container_width=True):
+                    st.session_state.selected_event = event
+                    # Raporu temizle
+                    if 'report' in st.session_state:
+                        del st.session_state.report
+                    st.rerun()
 
-st.caption("Bu analiz, yapay zeka tarafından kamuya açık veriler ve X (Twitter) paylaşımları işlenerek oluşturulmuştur.")
+with col2:
+    st.header("📝 Analiz Paneli")
+    if 'selected_event' not in st.session_state:
+        st.info("Lütfen sol panelden analiz etmek için bir haber seçin.")
+    else:
+        event = st.session_state.selected_event
+        st.subheader(event['headline'])
+        st.caption(f"Kaynak: [{event['url']}]({event['url']})")
+        
+        if st.button("🤖 Bu Olayı Analiz Et", type="primary", use_container_width=True):
+            if not client:
+                st.error("Lütfen Grok API anahtarını Streamlit Secrets'a ekleyin.")
+            else:
+                with st.spinner("AI, Google Arama simülasyonu ile istihbarat topluyor..."):
+                    report = analyze_event_with_stable_engine(client, event['headline'], event['summary'])
+                    if report and report.get('tahmini_koordinat'):
+                        coords = report.get('tahmini_koordinat', {})
+                        lat, lon = coords.get('lat'), coords.get('lon')
+                        if lat and lon:
+                            report['komsu_tesisler'] = find_neighboring_facilities(google_api_key, lat, lon)
+                    st.session_state.report = report
+
+        if 'report' in st.session_state and st.session_state.report:
+            report = st.session_state.report
+            st.markdown("---")
+            
+            col_title, col_score = st.columns([4, 1])
+            with col_title:
+                st.subheader(f"Rapor: {report.get('tesis_adi', 'Teyit Edilemedi')}")
+            with col_score:
+                score = report.get('guven_skoru', 0)
+                st.metric(label="Güven Skoru", value=f"{score}/5", help="AI'ın bu tespiti yaparkenki güven seviyesi (1=Zayıf, 5=Çok Güçlü)")
+
+            st.info(f"**Kanıt Zinciri:** {report.get('kanit_zinciri', 'N/A')}")
+            
+            st.success(f"**Güncel Durum:** {report.get('guncel_durum', 'N/A')}")
+            st.warning(f"**Olay Özeti:** {report.get('olay_ozeti', 'N/A')}")
+            
+            with st.expander("Olay Yeri Haritası ve Çevre Analizi", expanded=True):
+                coords = report.get('tahmini_koordinat', {})
+                lat, lon = coords.get('lat'), coords.get('lon')
+                if lat and lon:
+                    try:
+                        m = folium.Map(location=[float(lat), float(lon)], zoom_start=14, tiles="CartoDB positron")
+                        folium.Marker([float(lat), float(lon)], 
+                                      popup=f"<b>{report.get('tesis_adi')}</b>", 
+                                      icon=folium.Icon(color='red', icon='fire')).add_to(m)
+                        
+                        neighbors = report.get('komsu_tesisler', [])
+                        for neighbor in neighbors:
+                            if neighbor.get('lat') and neighbor.get('lng'):
+                                folium.Marker([neighbor['lat'], neighbor['lng']], 
+                                              popup=f"<b>{neighbor['tesis_adi']}</b><br>{neighbor.get('adres', '')}", 
+                                              tooltip=neighbor['tesis_adi'],
+                                              icon=folium.Icon(color='blue', icon='industry', prefix='fa')).add_to(m)
+                        
+                        folium_static(m, height=400)
+
+                        if neighbors:
+                            st.write("Yakın Çevredeki Tesisler (1km - Google Maps Verisi)")
+                            st.dataframe(pd.DataFrame(neighbors)[['tesis_adi', 'adres']])
+
+                    except (ValueError, TypeError):
+                        st.warning("Rapor koordinatları geçersiz, harita çizilemiyor.")
+                else:
+                    st.info("Rapor, harita çizimi için koordinat bilgisi içermiyor.")
