@@ -1,9 +1,7 @@
-# Projenin temel framework'ü
 streamlit
-
-# API istekleri için gerekli (Tavily ve Grok)
-requests
-openai
-
-# Lokal geliştirme için API anahtarlarını .env dosyasından okumak için (önerilir)
+langchain
+langchain-openai
+langchain_community
+langchain-core
+tavily-python
 python-dotenv
