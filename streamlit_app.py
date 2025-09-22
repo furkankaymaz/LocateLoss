@@ -1,218 +1,159 @@
 # ==============================================================================
-#  NİHAİ KOD (v44.0): Stabil Tesis Tespiti ve Yenilenmiş Arayüz
+#  NİHAİ KOD (v51.0): Oto-İstihbarat Ajanı (Tavily Search + Grok API)
+#  AMAÇ: Kullanıcının genel sorgusunu otomatik olarak araştırıp, kanıta dayalı
+#  nihai bir rapor oluşturmak.
 # ==============================================================================
 import streamlit as st
-import pandas as pd
-import feedparser
-from openai import OpenAI
-import json
-import re
-from urllib.parse import quote
-import folium
-from streamlit_folium import folium_static
 import requests
-from rapidfuzz import fuzz
-import time
+from openai import OpenAI
+import os
 
 # ------------------------------------------------------------------------------
-# 1. TEMEL AYARLAR
+# 1. TEMEL AYARLAR VE GİZLİ ANAHTARLAR
 # ------------------------------------------------------------------------------
-st.set_page_config(layout="wide", page_title="Akıllı Hasar Tespiti")
-st.title("🛰️ Akıllı Endüstriyel Hasar Tespit Motoru")
+st.set_page_config(layout="wide", page_title="Oto-İstihbarat Ajanı")
+st.title("🛰️ Oto-İstihbarat Ajanı")
+st.info("Bu araç, girilen genel sorguyu profesyonel bir arama motoru (Tavily) ile araştırır ve toplanan kanıtları Grok AI ile analiz ederek nihai bir rapor oluşturur.")
 
-grok_api_key = st.secrets.get("GROK_API_KEY")
-google_api_key = st.secrets.get("GOOGLE_MAPS_API_KEY")
-client = OpenAI(api_key=grok_api_key, base_url="https://api.x.ai/v1") if grok_api_key else None
+# --- API Anahtarlarını Streamlit Secrets'tan güvenli bir şekilde al
+GROK_API_KEY = st.secrets.get("GROK_API_KEY")
+TAVILY_API_KEY = st.secrets.get("TAVILY_API_KEY")
+
+# --- API İstemcilerini Başlat
+grok_client = OpenAI(api_key=GROK_API_KEY, base_url="https://api.x.ai/v1") if GROK_API_KEY else None
 
 # ------------------------------------------------------------------------------
-# 2. ÇEKİRDEK FONKSİYONLAR
+# 2. ÇEKİRDEK FONKSİYONLAR: ARAŞTIRMA VE ANALİZ
 # ------------------------------------------------------------------------------
 
-@st.cache_data(ttl=900)
-def get_latest_events_from_rss_deduplicated():
-    """Google News RSS'ten en son olayları çeker, tarihe göre sıralar ve akıllıca tekilleştirir."""
-    locations = '"fabrika" OR "sanayi" OR "OSB" OR "liman" OR "depo"'
-    events = '"yangın" OR "patlama" OR "kaza" OR "sızıntı"'
-    q = f'({locations}) AND ({events})'
-    rss_url = f"https://news.google.com/rss/search?q={quote(q)}+when:3d&hl=tr&gl=TR&ceid=TR:tr"
+@st.cache_data(ttl=3600, show_spinner="Profesyonel Arama Motoru (Tavily) kanıtları topluyor...")
+def run_professional_search(query):
+    """
+    Tavily Arama API'sini kullanarak interneti tarar ve analiz için bir kanıt listesi oluşturur.
+    """
+    if not TAVILY_API_KEY:
+        st.error("Tavily API anahtarı bulunamadı. Lütfen Streamlit Secrets'a ekleyin.")
+        return None
     
     try:
-        feed = feedparser.parse(rss_url)
-        if not feed.entries:
-            return []
-        
-        # ÖNCE: Haberleri en yeniden en eskiye doğru sırala
-        sorted_entries = sorted(feed.entries, key=lambda e: getattr(e, 'published_parsed', time.gmtime(0)), reverse=True)
-        
-        unique_articles = []
-        seen_headlines = []
-        
-        # SONRA: Sıralanmış liste üzerinden tekilleştirme yap
-        for entry in sorted_entries:
-            headline = entry.title.split(" - ")[0].strip()
-            
-            if any(fuzz.ratio(headline, seen_headline) > 85 for seen_headline in seen_headlines):
-                continue
-
-            summary_text = re.sub('<[^<]+?>', '', entry.get('summary', ''))
-            unique_articles.append({
-                "headline": headline,
-                "summary": summary_text,
-                "url": entry.link
-            })
-            seen_headlines.append(headline)
-
-        return unique_articles[:15]
-    except Exception as e:
-        st.error(f"RSS akışı okunurken hata: {e}")
-        return []
-
-@st.cache_data(ttl=3600)
-def analyze_event_with_stable_engine(_client, headline, summary):
-    """
-    Tesis adını bulmaya odaklanmış, "Düşünce Süreci" ve "Güven Skoru" içeren stabil analiz motoru.
-    """
-    prompt = f"""
-    Sen, internetin tamamını taramış elit bir istihbarat analistisin. Ana görevin, sana verilen ipuçlarından yola çıkarak olayın yaşandığı TESİSİN TİCARİ UNVANINI bulmaktır.
-
-    SANA VERİLEN İPUÇLARI:
-    - BAŞLIK: "{headline}"
-    - ÖZET: "{summary}"
-
-    DÜŞÜNCE SÜRECİN (ADIM ADIM):
-    1.  **Arama Sorgusu Oluştur:** İpuçlarından en etkili Google arama sorgusunu zihninde oluştur (örn: 'Gebze Kömürcüler OSB boya fabrikası yangın').
-    2.  **Arama Sonuçlarını Değerlendir:** Hafızandaki bilgilere dayanarak, bu arama sonucunda karşına çıkacak haber başlıklarını ve snippet'leri düşün. Hangi güvenilir haber kaynaklarının (AA, DHA, yerel basın, resmi kurumlar) hangi şirket ismini verdiğini analiz et.
-    3.  **Teyit ve Güven Skoru Ata:** Farklı ve bağımsız kaynakların aynı ismi verip vermediğini kontrol et. Teyit seviyesine göre 1 (zayıf) ile 5 (çok güçlü) arasında bir güven skoru belirle.
-    4.  **Raporla:** Tüm bu simülasyon sürecinden elde ettiğin kesinleşmiş bilgileri, aşağıdaki JSON formatına eksiksiz bir şekilde dök.
-
-    JSON ÇIKTISI (SADECE JSON VER, AÇIKLAMA EKLEME):
-    {{
-      "tesis_adi": "Simülasyon sonucu bulunan en olası ticari unvan.",
-      "guven_skoru": "1-5 arası bir sayı.",
-      "kanit_zinciri": "Bu isme nasıl ulaştığının ve hangi kaynakların teyit ettiğinin detaylı açıklaması. Güven skorunun nedenini de belirt.",
-      "sehir_ilce": "Olayın yaşandığı yer.",
-      "olay_ozeti": "Olayın ne olduğu, fiziksel boyutu, nedeni ve sonuçları hakkında kısa ve net özet.",
-      "guncel_durum": "Üretim durması, müdahale durumu vb. en son bilgiler.",
-      "tahmini_koordinat": {{"lat": "...", "lon": "..."}}
-    }}
-    """
-    try:
-        response = _client.chat.completions.create(model="grok-4-fast-reasoning", messages=[{"role": "user", "content": prompt}], max_tokens=4096, temperature=0.1)
-        content = response.choices[0].message.content
-        match = re.search(r'\{.*\}', content, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-        st.error(f"AI, geçerli bir JSON formatı üretemedi. Ham yanıt: {content}")
-        return None
-    except Exception as e:
-        st.error(f"AI Analizi sırasında hata oluştu: {e}")
-        return None
-
-@st.cache_data(ttl=86400)
-def find_neighboring_facilities(api_key, lat, lon):
-    if not all([api_key, lat, lon]): return []
-    try:
-        keywords = quote("fabrika|depo|sanayi|tesis|lojistik|antrepo")
-        url = f"https://maps.googleapis.com/maps/api/place/nearbysearch/json?location={float(lat)},{float(lon)}&radius=1000&keyword={keywords}&key={api_key}"
-        response = requests.get(url, timeout=10)
+        response = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": TAVILY_API_KEY,
+                "query": query,
+                "search_depth": "advanced", # Daha derinlemesine arama
+                "include_answer": False,
+                "max_results": 10 # Analiz için en iyi 10 sonucu al
+            }
+        )
         response.raise_for_status()
-        results = response.json().get('results', [])
-        return [{
-            "tesis_adi": p.get('name'), "adres": p.get('vicinity'), 
-            "lat": p.get('geometry',{}).get('location',{}).get('lat'),
-            "lng": p.get('geometry',{}).get('location',{}).get('lng')
-        } for p in results[:10]]
-    except Exception as e:
-        st.warning(f"Google Places API hatası: {e}")
-        return []
-
-# ------------------------------------------------------------------------------
-# 3. YENİLENMİŞ STREAMLIT ARAYÜZÜ
-# ------------------------------------------------------------------------------
-col1, col2 = st.columns([1, 2], gap="large")
-
-with col1:
-    st.header("📰 Son Olaylar")
-    with st.spinner("Güncel ve tekil haberler taranıyor..."):
-        events = get_latest_events_from_rss_deduplicated()
-    
-    if not events:
-        st.warning("Analiz edilecek yeni bir olay bulunamadı.")
-    else:
-        # YENİ ARAYÜZ: Her haber için tıklanabilir kartlar
-        for event in events:
-            with st.container(border=True):
-                st.markdown(f"**{event['headline']}**")
-                if st.button("Bu Haberi Seç", key=event['url'], use_container_width=True):
-                    st.session_state.selected_event = event
-                    # Raporu temizle
-                    if 'report' in st.session_state:
-                        del st.session_state.report
-                    st.rerun()
-
-with col2:
-    st.header("📝 Analiz Paneli")
-    if 'selected_event' not in st.session_state:
-        st.info("Lütfen sol panelden analiz etmek için bir haber seçin.")
-    else:
-        event = st.session_state.selected_event
-        st.subheader(event['headline'])
-        st.caption(f"Kaynak: [{event['url']}]({event['url']})")
+        results = response.json()
         
-        if st.button("🤖 Bu Olayı Analiz Et", type="primary", use_container_width=True):
-            if not client:
-                st.error("Lütfen Grok API anahtarını Streamlit Secrets'a ekleyin.")
-            else:
-                with st.spinner("AI, Google Arama simülasyonu ile istihbarat topluyor..."):
-                    report = analyze_event_with_stable_engine(client, event['headline'], event['summary'])
-                    if report and report.get('tahmini_koordinat'):
-                        coords = report.get('tahmini_koordinat', {})
-                        lat, lon = coords.get('lat'), coords.get('lon')
-                        if lat and lon:
-                            report['komsu_tesisler'] = find_neighboring_facilities(google_api_key, lat, lon)
-                    st.session_state.report = report
+        # AI'nın analiz etmesi için kanıtları temiz bir formatta birleştir
+        context = "KANIT DOSYASI:\n\n"
+        for i, result in enumerate(results['results']):
+            context += f"Kaynak {i+1}:\n"
+            context += f"Başlık: {result['title']}\n"
+            context += f"URL: {result['url']}\n"
+            context += f"Özet: {result['content']}\n\n"
+        return context
+    except Exception as e:
+        st.error(f"Tavily Arama API'si ile kanıt toplanırken hata oluştu: {e}")
+        return None
 
-        if 'report' in st.session_state and st.session_state.report:
-            report = st.session_state.report
-            st.markdown("---")
-            
-            col_title, col_score = st.columns([4, 1])
-            with col_title:
-                st.subheader(f"Rapor: {report.get('tesis_adi', 'Teyit Edilemedi')}")
-            with col_score:
-                score = report.get('guven_skoru', 0)
-                st.metric(label="Güven Skoru", value=f"{score}/5", help="AI'ın bu tespiti yaparkenki güven seviyesi (1=Zayıf, 5=Çok Güçlü)")
+@st.cache_data(ttl=3600, show_spinner="Grok AI, toplanan kanıtları analiz edip raporu oluşturuyor...")
+def generate_final_report(_client, user_query, evidence_context):
+    """
+    Toplanan kanıtları ve kullanıcının orijinal sorgusunu kullanarak nihai raporu oluşturur.
+    """
+    if not _client:
+        st.error("Grok API anahtarı bulunamadı. Lütfen Streamlit Secrets'a ekleyin.")
+        return None
+        
+    prompt = f"""
+    Sen, kanıta dayalı çalışan bir Baş İstihbarat Analistisin. Halüsinasyona sıfır toleransın var. Sadece sana sunulan KANIT DOSYASI'ndaki bilgileri kullanacaksın.
 
-            st.info(f"**Kanıt Zinciri:** {report.get('kanit_zinciri', 'N/A')}")
-            
-            st.success(f"**Güncel Durum:** {report.get('guncel_durum', 'N/A')}")
-            st.warning(f"**Olay Özeti:** {report.get('olay_ozeti', 'N/A')}")
-            
-            with st.expander("Olay Yeri Haritası ve Çevre Analizi", expanded=True):
-                coords = report.get('tahmini_koordinat', {})
-                lat, lon = coords.get('lat'), coords.get('lon')
-                if lat and lon:
-                    try:
-                        m = folium.Map(location=[float(lat), float(lon)], zoom_start=14, tiles="CartoDB positron")
-                        folium.Marker([float(lat), float(lon)], 
-                                      popup=f"<b>{report.get('tesis_adi')}</b>", 
-                                      icon=folium.Icon(color='red', icon='fire')).add_to(m)
-                        
-                        neighbors = report.get('komsu_tesisler', [])
-                        for neighbor in neighbors:
-                            if neighbor.get('lat') and neighbor.get('lng'):
-                                folium.Marker([neighbor['lat'], neighbor['lng']], 
-                                              popup=f"<b>{neighbor['tesis_adi']}</b><br>{neighbor.get('adres', '')}", 
-                                              tooltip=neighbor['tesis_adi'],
-                                              icon=folium.Icon(color='blue', icon='industry', prefix='fa')).add_to(m)
-                        
-                        folium_static(m, height=400)
+    KULLANICININ ANA HEDEFİ: "{user_query}"
 
-                        if neighbors:
-                            st.write("Yakın Çevredeki Tesisler (1km - Google Maps Verisi)")
-                            st.dataframe(pd.DataFrame(neighbors)[['tesis_adi', 'adres']])
+    SANA SUNULAN KANIT DOSYASI (Gerçek zamanlı internet arama sonuçları):
+    ---
+    {evidence_context}
+    ---
 
-                    except (ValueError, TypeError):
-                        st.warning("Rapor koordinatları geçersiz, harita çizilemiyor.")
-                else:
-                    st.info("Rapor, harita çizimi için koordinat bilgisi içermiyor.")
+    GÖREVİN:
+    1. Yukarıdaki KANIT DOSYASI'nı dikkatlice incele.
+    2. Kullanıcının ana hedefini karşılayacak şekilde, bu kanıtlara dayanarak, aşağıdaki detaylı tablo formatında bir rapor oluştur.
+    3. Eğer bir bilgi (örn: reasürans detayı) kanıtlarda mevcut değilse, o hücreye "Kanıtlarda Belirtilmemiş" yaz. ASLA TAHMİN YÜRÜTME veya bilgi uydurma.
+    4. Tüm olayları, duplicate olmadan, tek bir Markdown tablosunda sun.
+    5. Referans URL sütununa, bilgiyi aldığın kaynağın URL'ini ekle.
+
+    İSTENEN ÇIKTI FORMATI:
+    | Sıra | Tarih | Şirket Adı | Açıklama ve Teyit | Hasarın Etkisi | Etkilenen Çevre Tesisleri (Detaylı Etki) | Referans URL |
+    |------|-------|------------|-------------------|----------------|-------------------------------------------|--------------|
+
+    """
+    try:
+        response = _client.chat.completions.create(
+            model="grok-4-fast-reasoning",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=4096, # Raporun uzun olabilmesi için
+            temperature=0.0, # Maksimum tutarlılık ve kanıta bağlılık
+            timeout=180.0 # Bu karmaşık işlem için daha uzun zaman aşımı
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        st.error(f"Grok AI ile rapor oluşturulurken hata oluştu: {e}")
+        return None
+
+# ------------------------------------------------------------------------------
+# 3. STREAMLIT ARAYÜZÜ
+# ------------------------------------------------------------------------------
+
+st.subheader("1. Adım: Otomatik Sorgu Oluşturun")
+
+# Tarih aralığı seçimi
+date_option = st.selectbox(
+    "Hangi Zaman Aralığını Taramak İstersiniz?",
+    ("Son 45 Gün", "Son 3 Ay", "Son 6 Ay", "Son 1 Yıl")
+)
+
+# Detay seviyesi seçimi
+detail_level = st.selectbox(
+    "Ne Kadar Detay İstiyorsunuz?",
+    ("Tüm Detaylar (Sigorta, Çevre Etkisi vb.)", "Sadece Tesis Adı ve Olay Özeti")
+)
+
+# Seçimlere göre otomatik sorgu oluşturma
+base_query = f"Türkiye'de {date_option.lower()} içinde gerçekleşmiş endüstriyel hasarları (fabrika, depo, OSB, liman, maden) bul."
+if "Tüm Detaylar" in detail_level:
+    full_query = f"{base_query} Bu olayları firma ismini net belirterek, farklı kaynaklardan teyit edip, sigortacılık açısından anlamlı detaylar (hasarın etkisi, etkilenen çevre tesisleri ve onlara olan etkiler) ile birlikte listeleyin. Hiçbir önemli olayı atlamayın."
+else:
+    full_query = f"{base_query} Bu olayları sadece tesis adını ve olayın kısa bir özetini içerecek şekilde listeleyin."
+
+user_query = st.text_area("Oluşturulan Otomatik Sorgu (İsterseniz düzenleyebilirsiniz):", full_query, height=150)
+
+st.subheader("2. Adım: Ajanı Başlatın")
+
+if st.button("Araştır ve Rapor Oluştur", type="primary", use_container_width=True):
+    if not TAVILY_API_KEY or not GROK_API_KEY:
+        st.error("Lütfen hem Grok hem de Tavily API anahtarlarını Streamlit Secrets'a eklediğinizden emin olun.")
+    else:
+        # Önceki sonuçları temizle
+        st.session_state.final_report = None
+        st.session_state.evidence_context = None
+
+        # Ajanı çalıştır
+        evidence = run_professional_search(user_query)
+        if evidence:
+            st.session_state.evidence_context = evidence
+            final_report = generate_final_report(grok_client, user_query, evidence)
+            st.session_state.final_report = final_report
+
+# --- SONUÇLARI GÖSTER ---
+if 'final_report' in st.session_state and st.session_state.final_report:
+    st.markdown("---")
+    st.subheader("Nihai İstihbarat Raporu")
+    st.markdown(st.session_state.final_report)
+
+    with st.expander("Ajanın Analiz Ettiği Ham Kanıtları Gör (Şeffaflık Raporu)"):
+        st.text_area("Tavily'den Gelen Kanıt Dosyası", st.session_state.get('evidence_context', 'Kanıt bulunamadı.'), height=400)
