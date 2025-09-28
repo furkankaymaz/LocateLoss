@@ -1,125 +1,170 @@
-# ==============================================================================
-#  NİHAİ KOD (v62.1 - Model Düzeltmesi): Rafine Otonom Ajan
-#  AMAÇ: v57.0'ın başarılı otonom mantığını, daha akıllı ve kapsamlı bir
-#  görev tanımı ile en iyi hale getirmek ve doğru model adını kullanmak.
-# ==============================================================================
 import streamlit as st
-import os
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain_openai import ChatOpenAI
-from langchain_community.tools.tavily_search import TavilySearchResults
-from langchain_core.prompts import ChatPromptTemplate
-import io
-from contextlib import redirect_stdout
-from datetime import datetime, timedelta
+import pandas as pd
+from datetime import datetime
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
+import folium
+from folium.plugins import MarkerCluster
+from streamlit_folium import st_folium
 
-# ------------------------------------------------------------------------------
-# 1. TEMEL AYARLAR VE API ANAHTARLARI
-# ------------------------------------------------------------------------------
-st.set_page_config(layout="wide", page_title="Otonom İstihbarat Ajanı")
-st.title("🛰️ Otonom İstihbarat Ajanı")
-st.info("Bu ajan, verilen genel hedef doğrultusunda, otonom olarak en iyi araştırma stratejisini belirler, kanıt toplar ve nihai raporu oluşturur.")
+st.set_page_config(page_title="Hasar Olay Haritası", layout="wide", page_icon="🧭")
 
-# --- API Anahtarlarını Streamlit Secrets'tan güvenli bir şekilde al
-TAVILY_API_KEY = st.secrets.get("TAVILY_API_KEY")
-GROK_API_KEY = st.secrets.get("GROK_API_KEY")
+# ---------- UI ----------
+st.title("Endüstriyel Hasar İstihbaratı — Olay Haritası & Detay Panosu")
+st.caption("Kaynaklı, alıntılı ve haritalı olay listesi. Alıntılar doğrudan haberlerden, linkler tıklanabilir.")
 
-# ------------------------------------------------------------------------------
-# 2. OTONOM AJANIN KURULUMU VE ÇALIŞTIRILMASI
-# ------------------------------------------------------------------------------
+uploaded = st.file_uploader("CSV yükleyin (UTF-8).", type=["csv"])
+if uploaded is None:
+    st.info("Örnek: yukarıdaki tablo başlıklarıyla hazırlanmış CSV yükleyin.")
+    st.stop()
 
-@st.cache_data(ttl=3600) # Aynı görev için sonucu 1 saat hafızada tut
-def run_autonomous_agent(user_objective):
-    """
-    Verilen hedef doğrultusunda, LangChain ile inşa edilmiş otonom bir ajanı çalıştırır.
-    Ajanın düşünce sürecini ve nihai çıktısını döndürür.
-    """
-    if not TAVILY_API_KEY or not GROK_API_KEY:
-        st.error("Lütfen hem Grok hem de Tavily API anahtarlarını Streamlit Secrets'a ekleyin.")
-        return None, None
+df = pd.read_csv(uploaded).fillna("")
 
-    # 1. Adım: Ajanın Araçlarını Tanımla (Tavily Arama Motoru)
-    tools = [TavilySearchResults(max_results=10)]
+# Normalize column names (tolerant)
+def col(name):
+    for c in df.columns:
+        if c.lower().strip() == name.lower().strip():
+            return c
+    return name  # fallback
 
-    # 2. Adım: Ajanın Beynini Tanımla (Grok API - Doğru ve Erişilebilir Model Adı ile)
-    llm = ChatOpenAI(
-        model_name="llama3-70b-8192",  # DÜZELTME: Genel erişime açık, resmi ve güçlü model adı
-        openai_api_key=GROK_API_KEY,
-        openai_api_base="https://api.x.ai/v1",
-        temperature=0,
-        streaming=False # Streamlit ile daha stabil çalışması için
-    )
+COL_DATE = col("Tarih")
+COL_CITY = col("İl/İlçe")
+COL_ADDR = col("OSB/Mevki (Parsel/Adres)")
+COL_NAME = col("Tesis Adı (Alternatifler)")
+COL_SECTOR = col("Sektör/Tip")
+COL_EVENT = col("Olay Türü")
+COL_METHOD = col("Doğrulama Yöntemi (A/B)")
+COL_CONF = col("Doğruluk Oranı")
+COL_CAUSE = col("Çıkış Şekli")
+COL_PD = col("PD Etkisi")
+COL_BI = col("BI Etkisi")
+COL_QUOTE = col("Alıntı")
+COL_SOURCES = col("Kaynaklar")
+COL_URLS = col("Kaynak URL’leri")
+COL_LAT = "Lat" if "Lat" in df.columns else None
+COL_LON = "Lon" if "Lon" in df.columns else None
 
-    # 3. Adım: Ajanın Karakterini ve Görevini Tanımlayan Prompt'u Oluştur
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", """Sen, Türkiye'deki güncel endüstriyel hasarlar konusunda uzman, sıfır halüsinasyon ilkesiyle çalışan bir OSINT analistisin.
+# Parse dates if possible
+def try_parse_date(x):
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(str(x), fmt).date()
+        except:
+            pass
+    return None
 
-        ANA GÖREVİN (MİSYON): Sana verilen zaman aralığı içinde Türkiye'de gerçekleşmiş, sigortacılık açısından önemli tüm endüstriyel hasarları (fabrika, depo, OSB, liman, maden vb.) bulmak ve raporlamak.
+df["_date"] = df[COL_DATE].apply(try_parse_date)
+min_d = df["_date"].min()
+max_d = df["_date"].max()
 
-        YOL GÖSTERİCİ İLKELERİN:
-        1.  **Kapsamlı Ol:** Sadece bir iki olay bulup durma. Görevin, mümkün olan en fazla sayıda anlamlı olayı ortaya çıkarmak. Bunun için farklı anahtar kelimelerle, farklı şehir ve sektörleri hedefleyerek birden çok arama yapmaktan çekinme. Amacın hiçbir önemli olayı kaçırmamak.
-        2.  **Tesis Adı Önceliği:** Raporunun en değerli kısmı tesis adıdır. Teyit edilmiş bir ticari unvan bulmak için tüm kanıtları dikkatle incele.
-        3.  **Güncelliği Koru:** Sadece sana belirtilen tarih aralığına odaklan.
-        4.  **Kanıta Daya:** Her bir bilgiyi, arama sonuçlarından bulduğun bir kaynağa dayandır.
-        5.  **Standartlara Uy:** Nihai çıktın, SADECE istenen formatta bir Markdown tablosu olmalıdır.
-
-        İSTENEN ÇIKTI FORMATI:
-        | Sıra | Tarih | Şirket Adı | Açıklama ve Teyit | Hasarın Etkisi | Referans URL |
-        |------|-------|------------|-------------------|----------------|--------------|
-        """),
-        ("human", "{input}"),
-        ("placeholder", "{agent_scratchpad}"),
-    ])
-
-    # 4. Adım: Ajanı İnşa Et
-    agent = create_tool_calling_agent(llm, tools, prompt)
-    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
-
-    # 5. Adım: Ajanı Görevlendir ve Düşünce Sürecini Yakala
-    thought_process_stream = io.StringIO()
-    try:
-        with redirect_stdout(thought_process_stream):
-            result = agent_executor.invoke({"input": user_objective})
-        
-        thought_process = thought_process_stream.getvalue()
-        final_output = result.get("output", "Bir çıktı üretilemedi.")
-        return final_output, thought_process
-        
-    except Exception as e:
-        st.error(f"Ajan çalışırken bir hata oluştu: {e}")
-        return None, thought_process_stream.getvalue()
-
-# ------------------------------------------------------------------------------
-# 3. STREAMLIT ARAYÜZÜ
-# ------------------------------------------------------------------------------
-
-# Tarih aralığını dinamik olarak hesapla
-today = datetime.now()
-start_date = today - timedelta(days=45)
-date_range_str = f"{start_date.strftime('%d %B %Y')} - {today.strftime('%d %B %Y')}"
-
-st.subheader("1. Adım: Ajanın Ana Görevini Onaylayın")
-# Ajanın ana hedefi artık sabit, net ve optimize edilmiş.
-user_objective = st.text_area(
-    "Ajanın araştırmasını istediğiniz ana hedef:",
-    f"Türkiye'de {date_range_str} tarihleri arasında gerçekleşmiş, basına yansımış (X dahil), sigortacılık açısından önemli ve hiçbir önemli olayı atlamayan kapsamlı bir endüstriyel hasar listesi oluştur. Her olay için tesis adını, tarihini, olayın özetini, etkilerini ve en güvenilir referans URL'ini içeren bir Markdown tablosu hazırla.",
-    height=150
-)
-
-st.subheader("2. Adım: Ajanı Başlatın")
-if st.button("Otonom Araştırmayı Başlat", type="primary", use_container_width=True):
-    with st.spinner("Otonom Ajan çalışıyor... Bu işlem, araştırmanın derinliğine göre birkaç dakika sürebilir. Ajan, en iyi sonuçları bulmak için arka planda birden çok arama yapmaktadır."):
-        final_report, thought_process = run_autonomous_agent(user_objective)
-        st.session_state.final_report = final_report
-        st.session_state.thought_process = thought_process
-
-# --- SONUÇLARI GÖSTER ---
-if 'final_report' in st.session_state and st.session_state.final_report:
+# ---------- Sidebar Filters ----------
+with st.sidebar:
+    st.subheader("Filtreler")
+    date_range = st.date_input("Tarih aralığı", value=(min_d, max_d) if min_d and max_d else None)
+    cities = sorted([c for c in df[COL_CITY].unique() if c])
+    city_sel = st.multiselect("İl/İlçe", cities, default=cities[:])
+    events = sorted([e for e in df[COL_EVENT].unique() if e])
+    event_sel = st.multiselect("Olay Türü", events, default=events[:])
+    method_sel = st.multiselect("Doğrulama", ["A", "B"], default=["A","B"])
     st.markdown("---")
-    st.subheader("Ajanın Nihai Raporu")
-    st.markdown(st.session_state.final_report)
+    show_neighbors = st.toggle("Çevre tesisleri olanları öne çıkar", value=True)
 
-    with st.expander("Ajanın Düşünce Sürecini Göster (Şeffaflık Raporu)"):
-        st.text_area("Ajanın Adım Adım Düşünceleri ve Yaptığı Aramalar:", 
-                     st.session_state.get('thought_process', 'Düşünce süreci kaydedilemedi.'), 
-                     height=400)
+# Apply filters
+q = df.copy()
+if date_range and all(date_range):
+    q = q[(q["_date"]>=date_range[0]) & (q["_date"]<=date_range[1])]
+if city_sel:
+    q = q[q[COL_CITY].isin(city_sel)]
+if event_sel:
+    q = q[q[COL_EVENT].isin(event_sel)]
+if method_sel:
+    q = q[q[COL_METHOD].str.upper().str.contains("|".join(method_sel))]
+
+# ---------- Geocoding ----------
+@st.cache_data(show_spinner=False)
+def geocode_series(address_series):
+    geolocator = Nominatim(user_agent="hasar-istihbarat/1.0")
+    geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1, swallow_exceptions=True)
+    coords = {}
+    for addr in address_series.unique():
+        if not addr: 
+            coords[addr] = (None, None)
+            continue
+        loc = geocode(addr + ", Türkiye")
+        if loc:
+            coords[addr] = (loc.latitude, loc.longitude)
+        else:
+            coords[addr] = (None, None)
+    return coords
+
+if COL_LAT and COL_LON:
+    q["_lat"] = pd.to_numeric(q[COL_LAT], errors="coerce")
+    q["_lon"] = pd.to_numeric(q[COL_LON], errors="coerce")
+else:
+    coords_map = geocode_series(q[COL_ADDR])
+    q["_lat"] = q[COL_ADDR].map(lambda a: coords_map.get(a, (None, None))[0])
+    q["_lon"] = q[COL_ADDR].map(lambda a: coords_map.get(a, (None, None))[1])
+
+q_geo = q.dropna(subset=["_lat","_lon"])
+
+# ---------- Map ----------
+color_map = {
+    "Yangın": "red",
+    "Patlama + Yangın": "orange",
+    "Kimyasal Sızıntı": "purple",
+    "Çökme/Göçük": "darkblue",
+    "Kran Devrilmesi": "cadetblue",
+}
+def get_color(evt):
+    for k,v in color_map.items():
+        if k.lower() in evt.lower():
+            return v
+    return "gray"
+
+m = folium.Map(location=[39.0, 35.0], zoom_start=6, control_scale=True)
+mc = MarkerCluster().add_to(m)
+
+for _, r in q_geo.iterrows():
+    title = f"{r[COL_NAME]} — {r[COL_EVENT]}"
+    popup = folium.Popup(html=f"""
+    <b>{r[COL_NAME]}</b><br>
+    <i>{r[COL_SECTOR]}</i><br>
+    <b>Olay:</b> {r[COL_EVENT]}<br>
+    <b>Tarih:</b> {r[COL_DATE]} — <b>İl/İlçe:</b> {r[COL_CITY]}<br>
+    <b>Adres/OSB:</b> {r[COL_ADDR]}<br>
+    <b>Çıkış şekli:</b> {r.get(COL_CAUSE,'')}<br>
+    <b>PD:</b> {r.get(COL_PD,'')}<br>
+    <b>BI:</b> {r.get(COL_BI,'')}<br>
+    <b>Doğrulama:</b> {r[COL_METHOD]} ({r[COL_CONF]})
+    """, max_width=420)
+    folium.CircleMarker(
+        location=[r["_lat"], r["_lon"]],
+        radius=7,
+        color=get_color(r[COL_EVENT]),
+        fill=True, fill_opacity=0.9,
+        popup=popup,
+        tooltip=title
+    ).add_to(mc)
+
+st_folium(m, width=None, height=560)
+
+# ---------- Cards / Table ----------
+st.subheader("Olay kartları")
+for _, r in q.sort_values(by="_date", ascending=False).iterrows():
+    with st.container(border=True):
+        st.markdown(f"### {r[COL_NAME]} — **{r[COL_EVENT]}**")
+        st.markdown(f"**Tarih:** {r[COL_DATE]}  •  **İl/İlçe:** {r[COL_CITY]}  •  **Doğrulama:** `{r[COL_METHOD]}`  •  **Doğruluk:** {r[COL_CONF]}")
+        st.markdown(f"**Adres/OSB:** {r[COL_ADDR]}  \n**Sektör:** {r[COL_SECTOR]}")
+        cols = st.columns(3)
+        cols[0].markdown(f"**Çıkış şekli**  \n{r.get(COL_CAUSE,'')}")
+        cols[1].markdown(f"**PD etkisi**  \n{r.get(COL_PD,'')}")
+        cols[2].markdown(f"**BI etkisi**  \n{r.get(COL_BI,'')}")
+        if r.get(COL_QUOTE, ""):
+            st.markdown(f"> {r[COL_QUOTE]}")
+        # Source badges
+        urls = [u.strip() for u in str(r.get(COL_URLS, "")).split(";") if u.strip()]
+        labels = [s.strip() for s in str(r.get(COL_SOURCES, "")).split("·")]
+        if urls:
+            st.write("**Kaynaklar:**", " ".join([f"[{labels[i] if i < len(labels) else 'Kaynak'}]({u})" for i,u in enumerate(urls)]))
+
+st.caption("Not: B kayıtlarında adres/OSB + resmî firma rehberi/harita eşleşmesi ile doğrulama yapılmıştır. Ek teyit bulunursa A’ya yükseltilir.")
